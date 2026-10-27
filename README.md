@@ -28,6 +28,8 @@
 - [测试](#测试)
 - [目录结构](#目录结构)
 - [设计说明：问答缓存的三层命中](#设计说明问答缓存的三层命中)
+- [设计说明：摘要为什么是一个 agent](#设计说明摘要为什么是一个-agent)
+- [设计说明：QA 为什么是 agent + 置信度闸门](#设计说明qa-为什么是-agent--置信度闸门)
 - [常见问题](#常见问题)
 - [安全提示与已知限制](#安全提示与已知限制)
 - [服务器部署（可选）](#服务器部署可选)
@@ -102,17 +104,19 @@
 |-------|------|
 | `IndexAgent` | 解析文档 → 按 hash 去重 → 切块 → 写 MySQL → 生成向量写 Milvus |
 | `SearchAgent` | 向量召回 + 文件名通道加权，返回带分数的分块 |
-| `QAAgent` | 组装上下文 → 调 LLM → 流式输出 → 附带引用 |
-| `SummaryAgent` | 摘要与关键词抽取 |
+| `QAAgent` | 检索 → 组装上下文 → 调 LLM → 流式输出；默认走 **ReAct 工具循环**，带置信度闸门（见[设计说明](#设计说明qa-为什么是-agent--置信度闸门)） |
+| `SummaryAgent` | 摘要与关键词：短文档单次生成；长文档走 **ReAct 工具循环**（先看结构，再按需读原文） |
 | `RelationAgent` | 文档相似度计算与知识图谱连边（名字边 + 语义边） |
 
 **一次提问的完整链路**：
 
 1. 前端 `POST /api/v1/qa/stream`
 2. 先查问答缓存（精确 → 词面 → 语义重排），命中就直接返回，整个过程 < 150ms
-3. 未命中：BGE-M3 编码问题 → Milvus 召回 top_k → 文件名通道加分 → 拼上下文
-4. DeepSeek 流式生成 → SSE 逐块推给前端（`meta` / `delta` / `error` / `done`）
-5. 顺手把「问题 + 答案」写进缓存，下次同样的问法直接命中
+3. 未命中：BGE-M3 编码问题 → Milvus 召回 top_k → 文件名通道加分
+4. **置信度闸门**判断：单次检索够用就直答；不够（低分 / 短追问 / 通读对比类）才进 ReAct 工具循环
+5. 走循环时，模型自己决定搜几次、改什么关键词、读哪几段，逐步累积证据
+6. DeepSeek 流式生成 → SSE 逐块推给前端（`meta` / `step` / `delta` / `error` / `done`）
+7. 顺手把「问题 + 答案」写进缓存，下次同样的问法直接命中
 
 ---
 
@@ -346,6 +350,15 @@ npm run dev
 | `QA_RERANK_THRESHOLD` | `0.995` | 语义最终判定阈值，见[设计说明](#设计说明问答缓存的三层命中) |
 | `QA_RERANK_CANDIDATES` | `3` | 每轮最多重排几条（每条约 40ms） |
 
+### 问答 agent
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `QA_AGENT_ENABLED` | `true` | 总开关；`false` 退回固定单次检索（改造前行为） |
+| `QA_AGENT_MAX_STEPS` | `3` | 证据收集最多几轮 LLM 往返（一轮内可并行多个工具调用） |
+| `QA_AGENT_SCORE_GATE` | `0.55` | 单次检索最高分低于该值就升级成 agent 换措辞重搜 |
+| `QA_TOOL_TRANSPORT` | `local` | 工具调用方式：`local` 直调（默认）/ `mcp` 走 MCP 协议（实验性，见[设计说明](#mcp)） |
+
 ### 历史对话
 
 | 变量 | 默认值 | 说明 |
@@ -366,12 +379,13 @@ npm run dev
 | POST | `/api/v1/documents/upload` | 上传文档，后台异步索引 |
 | GET | `/api/v1/documents` | 文档列表（分页 / 按状态筛选 / 按名称搜索） |
 | GET | `/api/v1/documents/{id}/content` | 正文预览 |
+| GET | `/api/v1/documents/{id}/summary-trace` | 摘要 Agent 的决策轨迹（读了哪几段、每步用了多少字） |
 | PATCH | `/api/v1/documents/{id}` | 改文件名或标题（会即时重算该文档向量） |
 | DELETE | `/api/v1/documents/{id}` | 删除（向量 + 库记录 + 磁盘文件） |
 | POST | `/api/v1/documents/{id}/reindex` | 重新索引 |
 | POST | `/api/v1/search` | 语义检索 |
 | POST | `/api/v1/qa` | 问答（一次性返回 JSON） |
-| POST | `/api/v1/qa/stream` | 问答（SSE 流式，事件：`meta` / `delta` / `error` / `done`） |
+| POST | `/api/v1/qa/stream` | 问答（SSE 流式，事件：`meta` / `step` / `delta` / `error` / `done`） |
 | GET | `/api/v1/graph` | 知识图谱（支持 `min_score` 阈值参数） |
 | GET | `/api/v1/stats` | 知识库统计 |
 | GET | `/api/v1/health` | 健康检查 |
@@ -417,6 +431,10 @@ cd backend
 | `verify_history_ui.py` | 后端 + 前端 + Playwright | 会话侧栏：新建 / 重命名 / 删除 / 刷新保持 / 缓存徽章，共 20 项 |
 | `verify_filename_ui.py` | 后端 + 前端 + Playwright | 文件名在检索结果与图谱里的展示、改名弹窗，共 19 项 |
 | `ui_test.py` | 后端 + 前端 + Playwright | 全流程走查并截图，共 7 项 |
+| `verify_summary_agent.py` | 仅 LLM | 摘要 Agent：结论埋在末尾时是否真的读到尾部、步数上限、重复读取防护、reduce 兜底、短文档走单次，共 16 项 |
+| `verify_qa_agent.py` | 后端 + LLM | QA Agent：置信度闸门（高分直出 / 触发词 / 短追问）、agent 关闭降级、强制循环、轮次预算、同步 run、边界，共 10 项 |
+| `eval_qa_retrieval.py` | 后端 | 检索层评测：12 单轮 + 3 多轮，检查关键词是否落在召回分块里 |
+| `eval_qa_agent.py` | 后端 + LLM | 答案层评测：同一套指标拨 `QA_AGENT_ENABLED` 开关做 A/B，报告 steps 与延迟 |
 
 跑 UI 测试前需要设两个环境变量（否则 Playwright 会报 `EPERM ... mkdtemp`）：
 
@@ -536,6 +554,159 @@ knowledge-manager/
 也试过让 DeepSeek 判断"这两个问题是不是同一个意思"：召回 64.3%、精确 100%，
 但单次判定要 **1.7 秒**，比重新生成答案还慢，所以没接进热路径。
 评测代码留在 `evaluate_llm_judge.py`，想接的话改 `qa_cache_service` 的第三层即可。
+
+---
+
+## 设计说明：摘要为什么是一个 agent
+
+这是全项目唯一用了 ReAct 工具循环的地方。理由不是"多 Agent 听起来厉害"，而是这个任务真的具备两个前提：
+
+1. **关键信息不在开头**。实测本机 6 篇文档里，有 3 篇在 5900~7600 字之间，
+   而旧实现固定只读前 2500 字——超过一半的内容摘要根本没看到。
+2. **读哪里需要判断**。文档类型很杂（简历、问卷、技术方案），
+   没有固定规则能决定该读哪几段。
+
+所以 `SummaryAgent` 拿到的是四个工具，而不是一段截断的文本：
+
+| 工具 | 作用 |
+|------|------|
+| `get_outline` | 分块总数 + 每块开头 60 字，先建立结构认知 |
+| `read_chunks(start, end)` | 读原文，单次最多 6 块 |
+| `search_in_document(query)` | 复用 BM25 在本文档内定位 |
+| `finish(summary, keywords)` | 提交结果，任务结束 |
+
+一次真实的运行（17 块的技术方案文档）：
+
+```
+step1 get_outline                          chars=0
+step2 read_chunks {"start":0,"end":2}      chars=1291
+step2 read_chunks {"start":15,"end":16}    chars=1933   ← 先去读结尾的结论
+step3 read_chunks {"start":13,"end":14}    chars=2916
+step3 read_chunks {"start":11,"end":12}    chars=3774
+step4 finish                               chars=3774
+```
+
+**这就是 agent 和 workflow 的区别**：读哪三段的顺序，不是我写的，是它自己决定的。
+
+### 代价与控制
+
+| 项 | 单次摘要 | ReAct |
+|----|----------|-------|
+| LLM 调用 | 1 次 | 3~6 次 |
+| 一篇 17 块文档的耗时 | ~2s | ~19s |
+| 可复现性 | 完全确定 | 路径每次可能不同 |
+
+四道闸门保证它不会失控（缺一条就会卡在 `processing`）：
+
+- `max_steps = 6`：循环步数上限
+- `max_read_chunks = 6`：单次读取上限，防止一次灌满上下文
+- `max_total_chars = 20000`：累计读取预算，超了强制收尾
+- **reduce 兜底**：步数用完仍没结果，就用已读内容做一次普通摘要，保证一定有输出
+
+轨迹落在 `documents.summary_trace`，通过 `GET /api/v1/documents/{id}/summary-trace` 查看。
+agent 的行为不可复现，**必须能复盘"它到底读了哪几段"**，否则摘要错了都没法定位。
+
+前端在「文档管理」页点摘要单元格即可打开抽屉：摘要全文、关键词、以及每一步的
+`动作 + 累计读取字数` 时间线，例如
+
+```
+查看文档结构        共 17 个分块（下标 0~16）
+读取第 1~3 块       累计读取 1291 字
+读取第 14~17 块     累计读取 2918 字   ← 先去读结尾的结论
+读取第 12~13 块     累计读取 3776 字
+提交摘要            累计读取 3776 字
+```
+
+### 为什么不是全量 agent
+
+简单事实题（"月结余多少"）单次检索 2 秒就能答对，走完整工具循环要 8~10 秒。
+所以 QA 只在「单次检索结构上做不到」的时候才升级成 agent（见下节），其余保持确定性——
+**能论证必要性的地方才用，其余保持确定性**。
+
+---
+
+## 设计说明：QA 为什么是 agent + 置信度闸门
+
+`QAAgent` 的检索工具选择**不是**确定的：问题里出现文件名走词法通道、否则走向量，
+这条规则只覆盖了一半场景。另一半——追问里的指代（"那第二点呢"）、跨文档对比、
+通读整篇、一次搜不到换措辞重试——没有固定规则能预先写死，只能让模型自己判断。
+所以 QA 从固定工作流改成了 **ReAct 工具循环**。
+
+### 四个工具
+
+| 工具 | 作用 |
+|------|------|
+| `search_kb(query, top_k)` | 语义检索，可换措辞多次调用 |
+| `search_by_filename(name)` | 按文件名/标题定位文档，拿到文档 id 和分块数 |
+| `read_document(id, start, end)` | 读某篇文档的原文区间，用于通读或补全半句话 |
+| `list_documents` | 列出所有文档，用于"有哪些"或跨文档对比 |
+
+循环**只负责收集证据**（按 `(文档, 片段)` 去重），收够了调 `finish`，最终作答仍走原来的
+流式链——这样既保住 SSE，又不会二次生成。
+
+一次真实的多轮追问（用户上一句问损失函数，这一句"那第二点呢"）：
+
+```
+search_kb("优化器 比较 Adam SGD 学习率")       ← 从"那第二点呢"自己改写出的完整问题
+search_by_filename("作业2-李昊燃")             ← 从历史推断用户指的哪份文档
+read_document(96, 5~6)                        ← 去读实验表格
+finish
+```
+
+**证据收集做什么完全由模型决定**——搜几次、用什么词、读哪篇，代码里没有任何预设。
+
+### 置信度闸门：不是所有问题都付 agent 的代价
+
+全量走循环，简单题也要 10 秒，不能接受。所以先做一次单次检索，再判断要不要升级：
+
+| 触发条件 | 为什么单次检索做不到 |
+|----------|----------------------|
+| 检索零命中 / 最高分 < `QA_AGENT_SCORE_GATE` | 需要换措辞重搜 |
+| 有历史 + 短追问（≤12 字）或指代词开头（那/这/它/其中…） | 需要先把指代展开成完整问题 |
+| 含「总结/全文/对比/有哪些/列出/分别有…」 | 单次检索结构上给不了 |
+
+刻意**不含「比较」**——"比较的损失函数是哪一个"是在问某个值，不是要做对比，
+算进来只会让简单问题白白多花 4 秒。
+
+### 三层兜底
+
+1. `QA_AGENT_ENABLED=false` → 完全退回改造前行为（单次检索 + 作答）
+2. 循环抛异常 → 自动降级为单次检索，响应里标 `degraded=true`
+3. 循环一步工具都没调成 → 用单次检索结果兜底
+
+### 实测（同一套 15 条评测，拨开关做 A/B）
+
+| | agent 关 | agent 开 |
+|---|---|---|
+| 单轮 | 92%（2.8s） | 92%（4.2s） |
+| **多轮追问** | **67%**（4.4s） | **100%**（8.0s） |
+| 合计 | 87%（3.6s） | **93%**（6.1s） |
+
+分数提升全在多轮追问。延迟是真代价：agent 问题的 6~9 秒比单次检索的 2 秒更让人等得难受，
+所以前端把 `step` 事件渲染成「🔍 检索了什么 / 📄 读了哪几段」时间线，把等待变成可看的进度。
+
+### MCP
+
+`backend/app/mcp_server.py` 把同一套 `TOOL_SCHEMAS` 包成 stdio MCP server，可被
+Claude Desktop 等宿主直接调用：
+
+```json
+{
+  "knowledge-manager": {
+    "command": "python",
+    "args": ["-m", "app.mcp_server"],
+    "env": { "PYTHONPATH": "F:/agent/agentuse/backend" }
+  }
+}
+```
+
+`QA_TOOL_TRANSPORT=mcp` 时，agent 内部改走 MCP 协议调工具（默认 `local` 直调，不付子进程开销）。
+
+> ⚠️ **实验性**：`QA_TOOL_TRANSPORT=mcp`（内部 agent 走 MCP）目前是实验特性。
+> 在 Windows 上，`search_kb` 这类需要加载 BGE 模型的工具会在 MCP 的 stdio 子进程里
+> 卡死（`list_documents` / `read_document` 等纯 MySQL 工具正常），根因是 anyio 子进程
+> 与 transformers 初始化的交互，尚未定位。默认的 `local` 直调不受影响，是生产路径。
+> **外部宿主**（如 Claude Desktop）直接连 `mcp_server.py` 不受此问题影响。
 
 ---
 
