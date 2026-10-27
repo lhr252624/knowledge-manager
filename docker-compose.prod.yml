@@ -1,0 +1,143 @@
+# ==========================================
+# 生产环境编排（服务器部署用）
+# 使用：docker compose -f docker-compose.prod.yml up -d --build
+# ==========================================
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: km_backend
+    env_file:
+      - .env.prod
+    environment:
+      MYSQL_HOST: mysql
+      MILVUS_HOST: milvus-standalone
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data/documents:/app/data/documents
+      - ./data/uploads:/app/data/uploads
+      - ./models:/app/models:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+      milvus-standalone:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - km_net
+    # 如需 GPU 加速 BGE 编码，取消下面注释并安装 nvidia-container-toolkit
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: km_frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - km_net
+
+  mysql:
+    image: mysql:8.0
+    container_name: km_mysql
+    environment:
+      # 没有默认值：必须先复制 .env.prod.example 为 .env.prod 并填好，
+      # 否则启动会直接报错，避免用一个公开的弱口令把库跑起来
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?请先在 .env.prod 里设置 MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: knowledge_manager
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - mysql_prod_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - km_net
+
+  milvus-etcd:
+    image: quay.io/coreos/etcd:v3.5.5
+    container_name: km_etcd
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - etcd_prod_data:/etcd
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - km_net
+
+  milvus-minio:
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    container_name: km_minio
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    volumes:
+      - minio_prod_data:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - km_net
+
+  milvus-standalone:
+    image: milvusdb/milvus:v2.4.1
+    container_name: km_milvus
+    environment:
+      ETCD_ENDPOINTS: milvus-etcd:2379
+      MINIO_ADDRESS: milvus-minio:9000
+    command: milvus run standalone
+    volumes:
+      - milvus_prod_data:/var/lib/milvus
+    ports:
+      - "19530:19530"
+    depends_on:
+      - milvus-etcd
+      - milvus-minio
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 90s
+    restart: unless-stopped
+    networks:
+      - km_net
+
+volumes:
+  mysql_prod_data:
+  etcd_prod_data:
+  minio_prod_data:
+  milvus_prod_data:
+
+networks:
+  km_net:
+    driver: bridge

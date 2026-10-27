@@ -1,0 +1,83 @@
+# ==========================================
+# 本仓库只放代码。以下内容一律不入库：
+#   - 任何密钥 / 本机配置
+#   - 用户上传的文档与运行期数据
+#   - 模型权重（几 GB，需自行下载）
+#   - 生成物与缓存
+# ==========================================
+
+# ---------- 密钥与本机配置（绝不提交） ----------
+.env
+.env.local
+.env.prod
+.env.*.local
+# 本机覆盖配置：里面有绝对路径和数据库口令
+config.override.json
+
+# ---------- 用户数据 ----------
+data/documents/*
+!data/documents/.gitkeep
+data/uploads/*
+!data/uploads/.gitkeep
+
+# ---------- 模型权重（体积大，按 README 自行下载） ----------
+# 注意前面加 / ：只忽略仓库根目录的 models/，
+# 否则会把 backend/app/models/（ORM 模型）一起忽略掉
+/models/
+*.bin
+*.safetensors
+*.onnx
+*.gguf
+
+# ---------- 运行日志 ----------
+logs/
+*.log
+
+# ---------- 截图（内含真实文档名，按需本地生成） ----------
+screenshots/
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+build/
+dist/
+venv/
+.venv/
+env/
+ENV/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+# jieba 首次分词生成的词典缓存，删了会自动重建
+jieba.cache
+# torch 的即时编译缓存
+torchinductor_for/
+
+# ---------- 测试临时目录 ----------
+.tmp/
+.tmp-*.log
+.playwright/
+
+# ---------- Node / 前端 ----------
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# ---------- IDE / 操作系统 ----------
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# ---------- Docker 本地覆盖 ----------
+docker-compose.override.yml
+
+# ---------- Milvus / MySQL 本地数据 ----------
+milvus_data/
+mysql_data/
