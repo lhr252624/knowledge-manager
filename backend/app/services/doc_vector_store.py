@@ -36,8 +36,8 @@ from app.utils.name_matcher import strip_ext
 
 settings = get_settings()
 
-# 模型换了（路径/维度变了）就让全部缓存失效
-MODEL_TAG = f"{settings.bge_model_path}|{embedding_service.dimension}"
+# 模型换了（提供方/路径/维度变了）就让全部缓存失效
+MODEL_TAG = embedding_service.model_tag
 
 
 def build_representation(row: Dict[str, Any]) -> str:

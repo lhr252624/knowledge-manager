@@ -31,7 +31,13 @@ def health_detail():
         "status": "ok" if all(checks.values()) else "degraded",
         "checks": checks,
         "embedding": {
-            "model": settings.bge_model_path,
+            "provider": embedding_service.provider,
+            "model": (
+                settings.dashscope_embedding_model
+                if embedding_service.is_remote
+                else settings.bge_model_path
+            ),
+            "dim": settings.embedding_dim,
             "loaded": embedding_service.is_loaded(),
             "device": embedding_service.device,
         },

@@ -82,18 +82,48 @@ class MilvusStore:
         ]
         return CollectionSchema(fields=fields, description="知识库文档分块向量")
 
+    def _collection_name(self) -> str:
+        """
+        集合名解析
+
+        远程嵌入模式下追加向量空间后缀：本地 BGE-M3 与百炼的向量不可混用
+        （同为 1024 维但不在同一个空间），维度检查抓不住这种问题。
+        用独立集合名做物理隔离，切回本地时原数据仍在。
+        """
+        base = settings.milvus_collection
+        if embedding_service.is_remote:
+            return f"{base}__{embedding_service.space_tag}"
+        return base
+
     def _ensure_collection(self) -> None:
-        name = settings.milvus_collection
+        name = self._collection_name()
+        expected_dim = embedding_service.dimension
+
         if utility.has_collection(name, using=_ALIAS):
             self._collection = Collection(name, using=_ALIAS)
+            actual_dim = next(
+                (
+                    int(f.params.get("dim", 0))
+                    for f in self._collection.schema.fields
+                    if f.name == "embedding"
+                ),
+                expected_dim,
+            )
+            if actual_dim != expected_dim:
+                raise RuntimeError(
+                    f"集合 {name} 的向量维度是 {actual_dim}，当前配置是 {expected_dim}。"
+                    f"请修改 MILVUS_COLLECTION 换一个新集合名，或重建索引"
+                )
             logger.info(
-                f"已存在集合 {name}，当前实体数 {self._collection.num_entities}"
+                f"已存在集合 {name}（{actual_dim} 维，向量空间={embedding_service.model_tag}），"
+                f"当前实体数 {self._collection.num_entities}"
             )
         else:
-            logger.info(f"创建集合 {name} ...")
+            logger.info(f"创建集合 {name}（{expected_dim} 维）...")
             self._collection = Collection(
                 name=name, schema=self._build_schema(), using=_ALIAS
             )
+
             index_params = {
                 "metric_type": "IP",
                 "index_type": "HNSW",
@@ -240,7 +270,7 @@ class MilvusStore:
 
     def drop_all(self) -> None:
         """清空集合（开发调试用）"""
-        name = settings.milvus_collection
+        name = self._collection_name()
         if utility.has_collection(name, using=_ALIAS):
             utility.drop_collection(name, using=_ALIAS)
             self._ready = False
