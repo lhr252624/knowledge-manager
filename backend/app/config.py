@@ -78,6 +78,20 @@ class Settings(BaseSettings):
     search_top_k: int = 5
     score_threshold: float = 0.0
 
+    # ---------- 问答 agent ----------
+    # True : 模型在工具循环里自己收集证据（可多次检索、换措辞重试、读整篇、跨文档）
+    # False: 退回固定单次检索 + 作答（改造前的行为），用于对照与排障
+    qa_agent_enabled: bool = True
+    # 证据收集最多几步。每步一次 LLM 往返，3 步大约多花 3~4 秒
+    qa_agent_max_steps: int = 3
+    # 单次检索的最高分低于该值时，认为"一次没搜好"，交给 agent 换措辞重搜。
+    # 调高 = 更多问题走 agent（更准但更慢），调低 = 更多问题走单次检索（更快）
+    qa_agent_score_gate: float = 0.55
+    # 工具调用传输方式：local（直接调用，默认）| mcp（通过 MCP 协议调用）
+    # mcp 为实验特性：Windows 上 search_kb（加载 BGE 模型）会在 stdio 子进程里卡死，
+    # 生产环境请保持 local。外部宿主直接连 mcp_server.py 不受影响。
+    qa_tool_transport: str = "local"
+
     # ---------- 文件名匹配 ----------
     # 文件名/标题参与嵌入（写入向量库前把名字拼进正文）
     embed_with_name: bool = True

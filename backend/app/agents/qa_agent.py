@@ -1,17 +1,31 @@
 """
-QAAgent - 检索增强问答智能体
+QAAgent - 知识库问答 agent
 
-流程（RAG）：
-    问题 -> 向量召回 Top-K 片段 -> 构造上下文 -> LangChain Chain -> 答案 + 引用
+两种模式（由 settings.qa_agent_enabled 控制，默认 agent）：
+
+    agent（默认）
+        模型在工具循环里自己收集证据：可以多次检索、换措辞再搜、读整篇文档、
+        跨文档查。收集够了再基于这些证据作答。
+        —— 解决的是"固定单次检索"做不到的事：追问、通读、对比、搜不到重试。
+
+    workflow（降级）
+        问题 -> 向量召回 Top-K -> 构造上下文 -> LangChain Chain -> 答案
+        agent 循环异常或超出预算时自动退化为这条路径，保证不会比原来更差。
 """
 from typing import Any, AsyncIterator, Dict, List, Optional
 
+from loguru import logger
 
 from app.agents.base_agent import BaseAgent
+from app.agents.qa_tools import TOOL_SCHEMAS, QAToolbox
 from app.config import get_settings
 from app.services.milvus_store import milvus_store
 
 settings = get_settings()
+
+# 从历史里截取多少轮，以及每轮答案保留多少字（历史只用于"理解在问什么"）
+_HISTORY_TURNS = 4
+_HISTORY_ANSWER_CHARS = 120
 
 _SYSTEM_PROMPT = """你是「智能知识管理系统」的问答助手。请严格依据用户提供的【参考资料】回答问题。
 
@@ -27,6 +41,56 @@ _SYSTEM_PROMPT = """你是「智能知识管理系统」的问答助手。请严
 """
 
 _USER_TEMPLATE = "{prompt}"
+
+# ---------------- 证据收集循环的提示词 ----------------
+_RESEARCH_SYSTEM = """你是知识库问答 agent。你的任务不是写答案，而是**收集足以回答问题的资料**。
+
+可用工具：search_kb（语义检索）、search_by_filename（按名字找文档）、
+read_document（读某篇文档的原文）、list_documents（列出所有文档）。
+
+**停止条件（最重要）**：只要手上已有的片段能直接回答问题，立刻调用 finish。
+不要为了"更稳妥""更全面"而多调工具——每多一步就多一次模型往返，用户要多等几秒。
+一次 search_kb 就拿到明确答案的简单事实题，应当 1~2 步就 finish。
+
+策略：
+1. 如果给了【对话历史】，先判断当前问题到底在问什么。
+   遇到"那第二点呢""这个呢""它"这类指代，必须先从历史里推断出完整问题，
+   再用改写后的完整问题去检索——不要拿代词本身去搜。这一步是必须的。
+2. 检索结果明显不相关（结论性内容缺失），才换一组关键词重搜；最多重搜 2 次，
+   不要重复同一个 query。
+3. 只有以下情况才用 read_document：用户要求通读/总结整篇，
+   或检索命中的片段明显是"半句话"，需要看上下文。
+4. 只有用户问"有哪些文档"或明确要做跨文档对比时，才用 list_documents。
+5. 用户点名某份文档、但检索没覆盖到时，用 search_by_filename 定位。
+6. 换了两三种方式确实找不到，才调用 give_up。
+7. 不要编造，不要把猜测当成事实。"""
+
+_LOOP_TOOLS = TOOL_SCHEMAS + [
+    {
+        "type": "function",
+        "function": {
+            "name": "finish",
+            "description": "已收集到足够回答问题的资料，结束收集。",
+            "parameters": {
+                "type": "object",
+                "properties": {"reason": {"type": "string", "description": "简短说明"}},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "give_up",
+            "description": "换了多种方式检索仍找不到相关内容，结束收集。",
+            "parameters": {
+                "type": "object",
+                "properties": {"reason": {"type": "string", "description": "简短说明"}},
+                "required": [],
+            },
+        },
+    },
+]
 
 
 class QAAgent(BaseAgent):
@@ -100,25 +164,12 @@ class QAAgent(BaseAgent):
         return cites
 
     # ---------- 检索 ----------
-    def _retrieve(
-        self,
-        question: str,
-        top_k: int,
-        document_ids: Optional[List[int]],
-        use_name_match: bool = True,
-    ) -> List[Dict[str, Any]]:
-        from app.services.retrieval_service import retrieve
-
-        hits = retrieve(
-            query=question,
-            top_k=top_k,
-            document_ids=document_ids,
-            use_name_match=use_name_match,
-        )["hits"]
+    @staticmethod
+    def _enrich(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """补充标题（文件名优先用 Milvus 里记录的原值）"""
         if not hits:
             return hits
 
-        # 补充标题（文件名优先用 Milvus 里记录的原值）
         from app.db.database import session_scope
         from app.models.document import Document
 
@@ -135,6 +186,274 @@ class QAAgent(BaseAgent):
             h["title"] = meta.get("title") or h.get("filename")
             h["filename"] = meta.get("filename") or h.get("filename")
         return hits
+
+    def _retrieve(
+        self,
+        question: str,
+        top_k: int,
+        document_ids: Optional[List[int]],
+        use_name_match: bool = True,
+    ) -> List[Dict[str, Any]]:
+        from app.services.retrieval_service import retrieve
+
+        hits = retrieve(
+            query=question,
+            top_k=top_k,
+            document_ids=document_ids,
+            use_name_match=use_name_match,
+        )["hits"]
+        return self._enrich(hits)
+
+    # ---------- 证据收集（agent 循环）----------
+    @staticmethod
+    def _history_text(history: Optional[List[Dict[str, str]]]) -> str:
+        """把最近几轮对话压成一段提示。历史只用于理解"在问什么"，不提供事实。"""
+        if not history:
+            return ""
+        lines = ["【对话历史】（仅用于理解当前问题在问什么，事实必须来自检索结果）"]
+        for item in history[-_HISTORY_TURNS * 2 :]:
+            who = "用户" if item.get("role") == "user" else "助手"
+            content = (item.get("content") or "").strip().replace("\n", " ")
+            if who == "助手":
+                content = content[:_HISTORY_ANSWER_CHARS]
+            lines.append(f"{who}：{content}")
+        return "\n".join(lines) + "\n\n"
+
+    def _make_toolbox(
+        self,
+        top_k: int,
+        document_ids: Optional[List[int]],
+        use_name_match: bool,
+    ) -> QAToolbox:
+        """创建工具箱（本地直调或 MCP 代理）"""
+        transport = str(settings.qa_tool_transport).lower()
+        if transport == "mcp":
+            # MCP 模式：工具调用通过 stdio MCP server 中转
+            # 需要先启动 backend/app/mcp_server.py
+            from app.agents.qa_mcp_client import QAMCPToolbox
+            return QAMCPToolbox(top_k, document_ids, use_name_match)
+        # 默认 local：直接调用
+        return QAToolbox(top_k, document_ids, use_name_match)
+
+    def solve(
+        self,
+        question: str,
+        history: Optional[List[Dict[str, str]]] = None,
+        top_k: Optional[int] = None,
+        document_ids: Optional[List[int]] = None,
+        use_name_match: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        运行证据收集循环
+
+        Returns:
+            {
+              "chunks": 累积的片段（按首次出现顺序）,
+              "steps": 每一步的动作轨迹,
+              "gave_up": 模型是否主动放弃,
+              "queries": 实际用过的检索语句（便于复盘与评测）,
+            }
+        """
+        from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+
+        top_k = int(top_k or settings.search_top_k)
+        talk = int(settings.qa_agent_max_steps)
+        toolbox = self._make_toolbox(top_k, document_ids, use_name_match)
+
+        llm = self.llm.bind_tools(_LOOP_TOOLS)
+        messages = [
+            SystemMessage(content=_RESEARCH_SYSTEM),
+            HumanMessage(
+                content=(
+                    f"{self._history_text(history)}"
+                    f"【当前问题】{question}\n\n"
+                    "请开始收集资料，够了就调用 finish。"
+                )
+            ),
+        ]
+
+        steps: List[Dict[str, Any]] = []
+        queries: List[str] = []
+        gave_up = False
+        finished = False
+
+        try:
+            for step in range(1, talk + 1):
+                resp = llm.invoke(messages)
+                messages.append(resp)
+                calls = getattr(resp, "tool_calls", None) or []
+
+                # 只思考没动手：已有证据就当作够了，否则推一把
+                if not calls:
+                    if toolbox.is_empty():
+                        messages.append(HumanMessage(content="请先调用 search_kb 检索资料。"))
+                        steps.append(
+                            {"step": step, "tool": "thought", "args": {},
+                             "observation": (resp.content or "")[:120]}
+                        )
+                        continue
+                    steps.append(
+                        {"step": step, "tool": "thought", "args": {},
+                         "observation": (resp.content or "")[:120]}
+                    )
+                    finished = True
+                    break
+
+                for call in calls:
+                    name = call.get("name") or ""
+                    args = call.get("args") or {}
+                    call_id = call.get("id") or f"call_{step}"
+
+                    if name in ("finish", "give_up"):
+                        gave_up = name == "give_up"
+                        finished = True
+                        steps.append(
+                            {"step": step, "tool": name, "args": {},
+                             "observation": str(args.get("reason") or "")[:120]}
+                        )
+                        break
+
+                    observation = toolbox.call(name, args)
+                    messages.append(ToolMessage(content=observation, tool_call_id=call_id))
+                    if name == "search_kb":
+                        queries.append(str(args.get("query") or ""))
+                    steps.append(
+                        {
+                            "step": step,
+                            "tool": name,
+                            "args": args,
+                            "observation": observation[:160],
+                            "evidence": len(toolbox.evidence),
+                            "chars": toolbox.chars,
+                        }
+                    )
+                    if toolbox.chars > 16000:
+                        messages.append(
+                            HumanMessage(content="读取预算已用尽，请立即调用 finish 基于现有资料结束。")
+                        )
+
+                if finished:
+                    break
+
+            chunks = self._enrich(toolbox.collected())
+
+            # 循环一个工具都没调（或全失败）：退回单次检索，保证有资料可用
+            if not chunks:
+                logger.info("agent 循环未收集到证据，退回单次检索")
+                chunks = self._retrieve(question, top_k, document_ids, use_name_match)
+
+            return {
+                "chunks": chunks,
+                "steps": steps,
+                "gave_up": gave_up,
+                "queries": queries,
+                "chars": toolbox.chars,
+            }
+        finally:
+            # MCP transport 持有常驻子进程与后台线程，必须释放
+            close = getattr(toolbox, "close", None)
+            if close:
+                close()
+
+    # ---------- 是否需要交给 agent ----------
+    # 触发 agent 的词：都是"单次检索结构上做不到"的需求。
+    # 刻意不含"比较"——"比较的损失函数是哪一个"是在问某个值，不是要做对比，
+    # 把它算进来会让简单问题白白多花 4 秒。
+    _TRIGGER_WORDS = (
+        "总结", "概述", "全文", "通读", "对比", "区别", "哪个更好",
+        "都有哪些", "有哪些", "列出", "分别有",
+    )
+    _REFER_WORDS = ("那", "这", "它", "他们", "其中", "上面", "刚才", "前面")
+
+    def _needs_agent(
+        self,
+        question: str,
+        chunks: List[Dict[str, Any]],
+        history: Optional[List[Dict[str, str]]],
+    ) -> bool:
+        """
+        判断这个问题是否值得走工具循环
+
+        闸门的意义：agent 每多一步就多一次模型往返（约 1.5~2s）。实测普通事实题
+        走完循环要 8~10 秒，而单次检索 2 秒就能答对——不值得。
+        所以只在"一次检索明显不够"的时候才升级成 agent：
+
+            - 检索没命中 / 最高分偏低        -> 需要换措辞重搜
+            - 存在对话上下文的短追问          -> 需要先把指代展开成完整问题
+            - 问题本身要求通读、对比、列清单   -> 单次检索结构上就做不到
+        """
+        if not chunks:
+            return True
+
+        q = (question or "").strip()
+        if any(word in q for word in self._TRIGGER_WORDS):
+            return True
+
+        if history and (len(q) <= 12 or any(q.startswith(w) for w in self._REFER_WORDS)):
+            return True
+
+        try:
+            top = float(chunks[0].get("score") or 0.0)
+        except (TypeError, ValueError):
+            top = 0.0
+        return top < float(settings.qa_agent_score_gate)
+
+    # ---------- 证据收集的统一入口（带降级）----------
+    def collect(
+        self,
+        question: str,
+        history: Optional[List[Dict[str, str]]] = None,
+        top_k: Optional[int] = None,
+        document_ids: Optional[List[int]] = None,
+        use_name_match: bool = True,
+        force_agent: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        收集回答所需的证据
+
+        先用固定单次检索拿到"基础证据"，再判断要不要交给 agent 循环：
+            - 不需要 -> 直接用单次结果作答（快，行为和改造前一致）
+            - 需要   -> 进入工具循环，可用多轮检索/读整篇/跨文档
+        agent 关闭或循环异常时同样退回单次结果——任何情况下都不该比改造前更差。
+        """
+        top_k = int(top_k or settings.search_top_k)
+        base = self._retrieve(question, top_k, document_ids, use_name_match)
+
+        if not settings.qa_agent_enabled and not force_agent:
+            return {
+                "chunks": base,
+                "steps": [],
+                "queries": [],
+                "gave_up": False,
+                "degraded": True,
+            }
+
+        if not force_agent and not self._needs_agent(question, base, history):
+            return {
+                "chunks": base,
+                "steps": [],
+                "queries": [],
+                "gave_up": False,
+                "gated": True,
+            }
+
+        try:
+            return self.solve(
+                question,
+                history=history,
+                top_k=top_k,
+                document_ids=document_ids,
+                use_name_match=use_name_match,
+            )
+        except Exception as exc:
+            logger.warning(f"agent 循环失败，降级为单次检索: {exc}")
+            return {
+                "chunks": base,
+                "steps": [],
+                "queries": [],
+                "gave_up": False,
+                "degraded": True,
+            }
 
     # ---------- 同步问答 ----------
     def run(self, **kwargs: Any) -> Dict[str, Any]:
@@ -154,13 +473,17 @@ class QAAgent(BaseAgent):
         use_name_match = kwargs.get("use_name_match", True)
         history = kwargs.get("history") or []
 
-        chunks = self._retrieve(question, top_k, document_ids, use_name_match)
+        solved = self.collect(question, history, top_k, document_ids, use_name_match)
+        chunks = solved["chunks"]
+
         if not chunks:
             return {
                 "question": question,
                 "answer": "知识库中暂未检索到与该问题相关的内容。请先上传相关文档，或换一种问法试试。",
                 "citations": [],
                 "retrieved": 0,
+                "steps": solved["steps"],
+                "queries": solved["queries"],
             }
 
         context = self._build_context(chunks)
@@ -171,6 +494,10 @@ class QAAgent(BaseAgent):
             "answer": answer,
             "citations": self._citations(chunks),
             "retrieved": len(chunks),
+            "steps": solved["steps"],
+            "queries": solved["queries"],
+            "gave_up": solved.get("gave_up", False),
+            "degraded": solved.get("degraded", False),
         }
 
     def _run_chain(
@@ -213,7 +540,9 @@ class QAAgent(BaseAgent):
         # （重复一次 = 多一次 BGE 编码 + 多一次 Milvus 查询）
         chunks = kwargs.get("chunks")
         if chunks is None:
-            chunks = self._retrieve(question, top_k, document_ids, use_name_match)
+            chunks = self.collect(
+                question, history, top_k, document_ids, use_name_match
+            )["chunks"]
 
         if not chunks:
             yield "知识库中暂未检索到与该问题相关的内容。请先上传相关文档，或换一种问法试试。"
@@ -231,18 +560,22 @@ class QAAgent(BaseAgent):
                 yield piece
 
     def prepare_stream(self, **kwargs: Any) -> Dict[str, Any]:
-        """SSE 场景下先返回引用信息，再流式吐答案"""
+        """SSE 场景下先跑证据收集，返回引用与轨迹，再由 astream 流式作答"""
         question = (kwargs.get("question") or "").strip()
-        top_k = int(kwargs.get("top_k") or settings.search_top_k)
-        chunks = self._retrieve(
+        solved = self.collect(
             question,
-            top_k,
+            kwargs.get("history") or [],
+            kwargs.get("top_k"),
             kwargs.get("document_ids"),
             kwargs.get("use_name_match", True),
         )
+        chunks = solved["chunks"]
         return {
             "chunks": chunks,
             "citations": self._citations(chunks) if chunks else [],
+            "steps": solved["steps"],
+            "queries": solved["queries"],
+            "degraded": solved.get("degraded", False),
         }
 
     def health(self) -> Dict[str, Any]:

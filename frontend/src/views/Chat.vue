@@ -136,6 +136,18 @@
               {{ streamCached ? '正在读取缓存…' : '正在检索并组织答案…' }}
             </div>
             <div v-else class="md" v-html="render(currentText)"></div>
+            
+            <!-- Agent 步骤时间线 -->
+            <div v-if="streamSteps.length" class="agent-steps">
+              <div class="steps-title">🔍 检索过程</div>
+              <div class="step-timeline">
+                <div v-for="(s, i) in streamSteps" :key="i" :class="['step-item', stepType(s)]">
+                  <span class="step-icon">{{ stepIcon(s) }}</span>
+                  <span class="step-text">{{ stepText(s) }}</span>
+                </div>
+              </div>
+            </div>
+
             <div v-if="streamCached" class="meta-line">
               <el-tag size="small" type="success" effect="plain" class="cache-badge">
                 缓存命中 · {{ methodLabel(streamCache?.method) }}
@@ -232,6 +244,8 @@ const samples = [
   '有哪些关键结论？',
   '这个项目的技术架构是什么？'
 ]
+
+const streamSteps = ref([])
 
 const hitRate = computed(() => {
   const total = cacheStats.value.session_hits + cacheStats.value.session_misses
@@ -433,6 +447,44 @@ async function doClearCache() {
   }
 }
 
+/* ---------------- Agent 步骤展示 ---------------- */
+const STEP_ICONS = {
+  search_kb: '🔍',
+  search_by_filename: '📂',
+  read_document: '📄',
+  list_documents: '📚',
+  finish: '✅',
+  give_up: '❌',
+  thought: '💭'
+}
+
+function stepIcon(s) {
+  return STEP_ICONS[s.tool] || '🔧'
+}
+
+function stepType(s) {
+  if (s.tool === 'finish') return 'success'
+  if (s.tool === 'give_up') return 'warning'
+  return 'info'
+}
+
+function stepText(s) {
+  const tool = s.tool
+  const args = s.args || {}
+  if (tool === 'search_kb') return `检索：${args.query || ''}`
+  if (tool === 'search_by_filename') return `查找文档：${args.name || ''}`
+  if (tool === 'read_document') {
+    const start = args.start_chunk ?? 0
+    const end = args.end_chunk ?? start
+    return `读取文档 ${args.document_id} 第 ${start + 1}~${end + 1} 块`
+  }
+  if (tool === 'list_documents') return '列出所有文档'
+  if (tool === 'finish') return `收集完成${args.reason ? `: ${args.reason}` : ''}`
+  if (tool === 'give_up') return `未找到${args.reason ? `: ${args.reason}` : ''}`
+  if (tool === 'thought') return '思考中'
+  return `${tool}(${JSON.stringify(args)})`
+}
+
 /* ---------------- 提问 ---------------- */
 function ask(preset) {
   const q = (preset ?? question.value).trim()
@@ -444,6 +496,7 @@ function ask(preset) {
   currentText.value = ''
   streamCached.value = false
   streamCache.value = null
+  streamSteps.value = []
 
   let citations = []
   let answer = ''
@@ -488,6 +541,7 @@ function ask(preset) {
           streamCached.value = true
           streamCache.value = cacheInfo
         }
+        streamSteps.value = meta.steps || []
         // 第一句话由后端建会话，这里把地址栏和当前会话同步过来
         if (meta.conversation_id && !convId) {
           convId = meta.conversation_id
@@ -506,6 +560,7 @@ function ask(preset) {
       },
       onDone: (data) => {
         if (data && data.latency_ms != null) latencyMs = data.latency_ms
+        // 保存最终步骤列表到消息（可选，暂不实现历史消息的步骤展示）
         finalize()
       }
     }
@@ -799,6 +854,45 @@ onMounted(async () => {
 .cite-title { color: #374151; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cite-file { color: #9ca3af; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cite-score { color: #9ca3af; }
+
+/* Agent 步骤时间线 */
+.agent-steps {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid #f3f4f6;
+}
+.steps-title {
+  font-size: 11px;
+  color: #6b7280;
+  margin-bottom: 6px;
+  font-weight: 600;
+}
+.step-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.step-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 12px;
+  padding: 3px 6px;
+  border-radius: 4px;
+  background: #f9fafb;
+}
+.step-item.success { background: #ecfdf5; color: #065f46; }
+.step-item.warning { background: #fef3c7; color: #92400e; }
+.step-item.info { background: #eff6ff; color: #1e40af; }
+.step-icon {
+  flex-shrink: 0;
+  font-size: 13px;
+}
+.step-text {
+  flex: 1;
+  line-height: 1.4;
+  word-break: break-word;
+}
 
 .composer {
   display: flex;

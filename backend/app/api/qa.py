@@ -157,6 +157,9 @@ def question_answer(req: QARequest, background_tasks: BackgroundTasks):
         "cached": hit is not None,
         "cache": _cache_payload(hit) if hit else None,
         "near": near,
+        "steps": [] if hit is not None else (result.get("steps") or []),
+        "queries": [] if hit is not None else (result.get("queries") or []),
+        "degraded": False if hit is not None else bool(result.get("degraded")),
         "latency_ms": latency_ms,
     }
 
@@ -188,6 +191,7 @@ async def question_answer_stream(req: QARequest, background_tasks: BackgroundTas
                 top_k=req.top_k,
                 document_ids=req.document_ids,
                 use_name_match=req.use_name_match,
+                history=history,
             )
         except Exception as exc:
             logger.exception("问答检索失败")
@@ -207,10 +211,18 @@ async def question_answer_stream(req: QARequest, background_tasks: BackgroundTas
         "cache": _cache_payload(hit) if hit else None,
         "near": near,
     }
+    if hit is None:
+        meta["steps"] = prepared.get("steps") or []
+        meta["degraded"] = bool(prepared.get("degraded"))
 
     async def event_generator():
         answer_parts = []
         yield _sse("meta", json.dumps(meta, ensure_ascii=False))
+
+        # agent 的收集过程：前端可以据此显示"检索了什么、读了几段"
+        # （收集在 meta 之前已经完成，这里只是逐条回放，不是实时推进）
+        for step in (meta.get("steps") or []):
+            yield _sse("step", json.dumps(step, ensure_ascii=False))
 
         if hit is not None:
             # 缓存命中也走同一套 delta 事件，前端不用区分两种渲染路径

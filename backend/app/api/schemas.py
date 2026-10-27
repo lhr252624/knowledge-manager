@@ -42,6 +42,11 @@ class QAResponse(BaseModel):
     cache: Optional[Dict[str, Any]] = None
     # 未命中但缓存里有相近问题时，回带候选，便于前端提示"你要问的是不是这个"
     near: Optional[Dict[str, Any]] = None
+    # agent 的证据收集轨迹（每次检索/读取），缓存命中时为空
+    steps: List[Dict[str, Any]] = []
+    queries: List[str] = []
+    # 是否因 agent 循环异常退回了单次检索
+    degraded: bool = False
     latency_ms: Optional[int] = None
 
 
