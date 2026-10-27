@@ -119,11 +119,12 @@ def decode_vector(blob: Optional[bytes]) -> Optional[np.ndarray]:
 
 
 def vector_tag() -> str:
-    """向量模型标识：换提供方/换模型/换维度后旧向量自然不匹配"""
+    """向量模型标识：换模型/换维度后旧向量自然不匹配"""
     try:
-        return embedding_service.model_tag
+        dim = embedding_service.dimension
     except Exception:
-        return "unknown"
+        dim = 0
+    return f"{settings.bge_model_path}|{dim}"
 
 
 class QACacheService:

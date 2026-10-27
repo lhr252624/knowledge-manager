@@ -121,8 +121,7 @@ def _warmup_embedding() -> None:
 
             embedding_service.encode("预热")
             logger.success(
-                f"嵌入就绪（provider={embedding_service.provider}, "
-                f"{embedding_service.device}, {embedding_service.dimension} 维）"
+                f"嵌入模型预热完成（{embedding_service.device}, {embedding_service.dimension} 维）"
             )
         except Exception as exc:  # 预热失败不影响服务，后续按需加载
             logger.warning(f"嵌入模型预热失败，将在首次调用时重试: {exc}")
@@ -133,7 +132,7 @@ def _warmup_embedding() -> None:
 app = FastAPI(
     title="智能知识管理系统",
     description=(
-        "基于 LangChain + BGE-M3/百炼嵌入 + Milvus 的知识库系统。\n\n"
+        "基于多 Agent（LangChain）+ BGE-M3 + Milvus 的本地知识库系统。\n\n"
         "Agent 分工：\n"
         "- **IndexAgent** 文档解析与向量入库\n"
         "- **SearchAgent** 语义检索\n"

@@ -41,27 +41,11 @@ class Settings(BaseSettings):
         "http://localhost:3000",
     ]
 
-    # ---------- 嵌入模型 ----------
-    # local    : 本地 BGE-M3（sentence-transformers，需 torch + 模型文件）
-    # dashscope: 阿里云百炼 OpenAI 兼容 /embeddings（无需本地模型，按量计费）
-    # 注意：换 provider / 换模型 / 换维度 = 换向量空间，历史向量必须重建索引
-    embedding_provider: str = "local"
-    # 向量维度。必须与 Milvus 集合和历史数据一致；百炼 v3/v4 支持 1024/768/512 等
-    embedding_dim: int = 1024
-
+    # ---------- BGE 嵌入模型 ----------
     bge_model_path: str = str(PROJECT_ROOT / "models" / "bge-m3")
     bge_device: str = "cuda"
     bge_batch_size: int = 16
     bge_max_length: int = 1024
-
-    # ---------- 阿里云百炼（embedding_provider=dashscope 时生效）----------
-    dashscope_api_key: str = ""
-    dashscope_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    dashscope_embedding_model: str = "text-embedding-v3"
-    # 单次请求最多条数（百炼 v3/v4 上限 10，超过会 400）
-    dashscope_batch_size: int = 10
-    dashscope_timeout: float = 30.0
-    dashscope_max_retries: int = 2
 
     # ---------- DeepSeek LLM ----------
     deepseek_api_key: str = ""
@@ -285,12 +269,8 @@ if __name__ == "__main__":
     print("=" * 52)
     print(f"  环境        : {s.environment}")
     print(f"  调试模式    : {s.debug}")
-    print(f"  嵌入提供方  : {s.embedding_provider}（{s.embedding_dim} 维）")
-    if (s.embedding_provider or "").lower() == "dashscope":
-        print(f"  百炼模型    : {s.dashscope_embedding_model} @ {s.dashscope_base_url}")
-    else:
-        print(f"  BGE 模型    : {s.bge_model_path}")
-        print(f"  BGE 设备    : {s.bge_device}")
+    print(f"  BGE 模型    : {s.bge_model_path}")
+    print(f"  BGE 设备    : {s.bge_device}")
     print(f"  LLM 模型    : {s.deepseek_model}")
     print(f"  API Key     : {'已配置' if s.deepseek_api_key else '缺失!'}")
     print(f"  MySQL       : {s.mysql_host}:{s.mysql_port}/{s.mysql_database}")
@@ -299,10 +279,7 @@ if __name__ == "__main__":
     print("=" * 52)
 
     missing = []
-    if (s.embedding_provider or "").lower() == "dashscope":
-        if not s.dashscope_api_key:
-            missing.append("DASHSCOPE_API_KEY 未设置（embedding_provider=dashscope）")
-    elif not Path(s.bge_model_path).is_dir():
+    if not Path(s.bge_model_path).is_dir():
         missing.append(f"BGE 模型目录不存在: {s.bge_model_path}")
     if not s.deepseek_api_key:
         missing.append("DEEPSEEK_API_KEY 未设置")

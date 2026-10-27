@@ -51,7 +51,6 @@ $env:PLAYWRIGHT_BROWSERS_PATH="$root\.playwright"
 | `verify_history_ui.py` | 后端 + 前端 + Playwright | 侧栏会话列表、新对话、重命名、删除、刷新后仍在、缓存命中徽章，共 20 项 |
 | `verify_filename_ui.py` | 后端 + 前端 + Playwright | 文件名在检索结果/知识图谱里的展示与改名弹窗（自建样例文档，跑完自动清理），共 19 项 |
 | `ui_test.py` | 后端 + 前端 + Playwright | 全流程走查（概览/上传/问答/检索/图谱）并截图到 `screenshots/` |
-| `verify_embedding_provider.py` | — （纯离线，不连网络） | 嵌入双提供方：批次切片、index 顺序还原、L2 归一化、维度校验、429 重试 / 401 不重试、dimensions 兼容性、集合名隔离，共 23 项 |
 
 ## 约定
 

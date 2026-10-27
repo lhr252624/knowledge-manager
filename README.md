@@ -19,8 +19,7 @@
 - [快速开始](#快速开始)
   - [方式一：Docker 一键起数据库（推荐）](#方式一docker-一键起数据库推荐)
   - [方式二：自己装 MySQL 与 Milvus](#方式二自己装-mysql-与-milvus)
-  - [方式三：用云端嵌入，跳过模型下载](#方式三用云端嵌入跳过模型下载)
-  - [下载模型（本地嵌入必需）](#下载模型本地嵌入必需)
+  - [下载模型](#下载模型)
   - [安装后端](#安装后端)
   - [配置文件](#配置文件)
   - [启动服务](#启动服务)
@@ -167,38 +166,7 @@ docker compose -f docker-compose.dev.yml up -d
 
 装好后把配置文件里的 `MYSQL_HOST/PORT` 和 `MILVUS_HOST/PORT` 指过去。
 
-### 方式三：用云端嵌入，跳过模型下载
-
-本项目需要两样本地模型：嵌入（BGE-M3，2.2GB）和重排（bge-reranker-large，2.2GB），还要装 PyTorch。
-**如果不想下这 4GB 模型、也没有显卡**，可以把嵌入换成阿里云百炼的云端接口。
-
-在 `.env.local`（或 `config.override.json`）里加三行：
-
-```ini
-EMBEDDING_PROVIDER=dashscope
-DASHSCOPE_API_KEY=sk-你的百炼Key
-EMBEDDING_DIM=1024
-```
-
-然后就可以跳过下面的模型下载，直接装后端。启动日志会显示
-`嵌入就绪（provider=dashscope, remote, 1024 维）`。
-
-几个必须知道的点：
-
-- **向量空间和本地完全不兼容**。同为 1024 维，但 BGE-M3 和百炼的向量不在同一空间，
-  混用不会报错，只会让检索结果悄悄变差。所以远程模式会自动使用独立的集合名
-  `km_chunks__ds_text_embedding_v3_1024`，切回本地时原来的 `km_chunks` 数据仍然在。
-- **切换模式必须重建索引**：改完配置后把已有文档重新索引一遍（或删了重传），
-  否则旧向量是另一个模型算的，检索会失效。
-- **云端返回的向量不是单位长度**，代码里已强制做 L2 归一化，否则 Milvus 的 IP 度量
-  会失去余弦语义。
-- **百炼单次请求最多 10 条文本**，已按批切片；每批失败会按 1.5s / 3s 退避重试，`401` 直接报错不重试。
-- **费用**：`text-embedding-v3` 每千 token 约 0.0005 元，新账号每个模型有 100 万 token
-  免费额度（90 天）。一本 300 页的书约 15 万 token，够建几百本。
-- **重排模型仍可用本地的**：`QA_RERANKER_ENABLED=false` 时缓存退化为前两层判定，
-  不影响问答本身。
-
-### 下载模型（本地嵌入必需）
+### 下载模型
 
 两个模型都放到项目根目录的 `models/` 下（该目录已在 `.gitignore` 里，不会提交）：
 
@@ -331,14 +299,7 @@ npm run dev
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `EMBEDDING_PROVIDER` | `local` | `local` = 本地 BGE-M3；`dashscope` = 阿里云百炼 |
-| `EMBEDDING_DIM` | `1024` | 向量维度，必须与 Milvus 集合一致；改了等于换向量空间 |
-| `DASHSCOPE_API_KEY` | 空 | `EMBEDDING_PROVIDER=dashscope` 时必填 |
-| `DASHSCOPE_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | 换成业务空间专属域名更快 |
-| `DASHSCOPE_EMBEDDING_MODEL` | `text-embedding-v3` | 也可用 `text-embedding-v4`（支持 2048/1536 维） |
-| `DASHSCOPE_BATCH_SIZE` | `10` | 百炼 v3/v4 单次上限 10，超过会 400 |
-| `DASHSCOPE_TIMEOUT` / `DASHSCOPE_MAX_RETRIES` | `30` / `2` | 超时秒数 / 失败重试次数 |
-| `BGE_MODEL_PATH` | `<root>/models/bge-m3` | 嵌入模型目录（仅 `local` 模式） |
+| `BGE_MODEL_PATH` | `<root>/models/bge-m3` | 嵌入模型目录 |
 | `BGE_DEVICE` | `cuda` | 改成 `cpu` 也能跑 |
 | `BGE_BATCH_SIZE` | `16` | 显存吃紧就调小到 `8` / `4` |
 | `BGE_MAX_LENGTH` | `1024` | 单块最大 token |
@@ -456,7 +417,6 @@ cd backend
 | `verify_history_ui.py` | 后端 + 前端 + Playwright | 会话侧栏：新建 / 重命名 / 删除 / 刷新保持 / 缓存徽章，共 20 项 |
 | `verify_filename_ui.py` | 后端 + 前端 + Playwright | 文件名在检索结果与图谱里的展示、改名弹窗，共 19 项 |
 | `ui_test.py` | 后端 + 前端 + Playwright | 全流程走查并截图，共 7 项 |
-| `verify_embedding_provider.py` | — （纯离线） | 嵌入双提供方：切片 / 顺序还原 / L2 归一化 / 维度校验 / 重试策略 / 集合隔离，共 23 项 |
 
 跑 UI 测试前需要设两个环境变量（否则 Playwright 会报 `EPERM ... mkdtemp`）：
 
@@ -665,11 +625,6 @@ Milvus 自己还依赖 etcd 和 MinIO，起来大约要 30~60 秒，等 healthy 
   服务重启时正在索引的任务会丢（文档停留在"处理中"状态，需要手动重建索引）。
 - **缓存判定是基于统计的**，不是形式化保证。极端情况下仍可能误命中，
   所以特意保留了数字 / 否定词守卫和保守阈值。
-- **向量空间与模型绑定**。换嵌入模型（本地的或云端的都一样）等于换向量空间，
-  必须重建索引；Milvus 只校验维度，同为 1024 维的不同模型它分辨不出来。
-  远程模式靠独立集合名隔离，本地模式需你自己改 `MILVUS_COLLECTION`。
-- **云端嵌入依赖外网**。百炼接口不可用时无法建索引，也无法查询（已有向量仍在，
-  但新问题没法编码）。想要离线可用就保持 `EMBEDDING_PROVIDER=local`。
 
 ---
 
