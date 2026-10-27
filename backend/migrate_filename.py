@@ -24,12 +24,11 @@ from typing import List
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from loguru import logger  # noqa: E402
 
 from app.db.database import session_scope  # noqa: E402
 from app.models.document import Chunk, Document, DocumentStatus  # noqa: E402
 from app.services.milvus_store import milvus_store  # noqa: E402
-from app.utils.name_matcher import is_placeholder_name, strip_ext  # noqa: E402
+from app.utils.name_matcher import is_placeholder_name  # noqa: E402
 
 
 def _derive_filename(title: str | None, file_type: str | None, stored_name: str) -> str:

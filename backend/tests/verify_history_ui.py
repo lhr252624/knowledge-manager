@@ -11,7 +11,6 @@
     .\\venv\\Scripts\\python.exe verify_history_ui.py
 """
 import sys
-import time
 from pathlib import Path
 
 import httpx

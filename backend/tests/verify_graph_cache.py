@@ -63,6 +63,7 @@ def main() -> int:
         t0 = time.perf_counter()
         second = get_graph(c)
         elapsed_cached = (time.perf_counter() - t0) * 1000
+        print(f"    耗时 {elapsed_cached:.0f} ms（全部复用，不该再编码）")
         stats2 = second.get("vector_stats") or {}
         check("全部复用", stats2.get("encoded") == 0 and stats2.get("reused") > 0, str(stats2))
         check(

@@ -36,7 +36,7 @@ SAMPLE_STEM = f"文件名验证-{uuid.uuid4().hex[:8]}"
 SAMPLE_NAME = f"{SAMPLE_STEM}.md"
 
 # 结论里放一个不常见的数字，方便断言引用确实来自这篇文档
-SAMPLE = f"""# 文件名验证样例文档
+SAMPLE = """# 文件名验证样例文档
 
 ## 结论
 本次验证的冲煮水温是 92 度，粉水比 1:15，闷蒸时间 30 秒。
@@ -75,8 +75,15 @@ def upload_sample() -> int:
     raise RuntimeError("样例文档索引超时")
 
 
-def cleanup() -> None:
-    """删掉本次上传的样例文档（不留下任何测试数据）"""
+def conversation_ids() -> set:
+    """当前所有会话 id（跑完只删自己新建的）"""
+    with httpx.Client(timeout=30) as client:
+        resp = client.get(f"{API}/conversations", params={"limit": 500})
+        return {c["id"] for c in resp.json().get("items", [])}
+
+
+def cleanup(conv_before) -> None:
+    """删掉本次上传的样例文档和本次新建的会话（不留下任何测试数据）"""
     try:
         with httpx.Client(timeout=120) as client:
             items = client.get(f"{API}/documents", params={"page": 1, "size": 100}).json()["items"]
@@ -84,6 +91,10 @@ def cleanup() -> None:
                 if item["filename"] == SAMPLE_NAME:
                     client.delete(f"{API}/documents/{item['id']}")
                     print(f"    已清理测试文档 id={item['id']}")
+            # 问答页提问会真的建会话，不清掉会留在用户侧边栏
+            for cid in conversation_ids() - conv_before:
+                client.delete(f"{API}/conversations/{cid}")
+                print(f"    已清理测试会话 id={cid}")
     except Exception as exc:
         print(f"    清理失败: {exc}")
 
@@ -93,11 +104,15 @@ def main() -> int:
     console_errors: list[str] = []
 
     print(f"\n[0] 准备样例文档 {SAMPLE_NAME}")
+    conv_before = conversation_ids()
     try:
         doc_id = upload_sample()
     except Exception as exc:
         print(f"  [FAIL] 样例文档上传失败：{exc}")
         print("  提示：确认后端 http://127.0.0.1:8000 在跑，且嵌入模型已就绪")
+        # 上传可能已经在服务端建好了文档（只是客户端连接被重置），照样清一遍
+        print("\n[5] 清理")
+        cleanup(conv_before)
         return 1
     check("样例文档已索引", bool(doc_id), f"id={doc_id}")
 
@@ -263,7 +278,7 @@ def main() -> int:
             browser.close()
     finally:
         print("\n[5] 清理")
-        cleanup()
+        cleanup(conv_before)
 
     print("\n" + "=" * 56)
     print(f"  通过 {len(passed)} 项 / 失败 {len(failed)} 项")

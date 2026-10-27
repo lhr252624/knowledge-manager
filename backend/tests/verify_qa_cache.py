@@ -38,7 +38,7 @@ def check(name, ok, detail=""):
 # ======================= A. 算法层 =======================
 def test_algorithm():
     from app.services.bm25 import BM25Index, softmax
-    from app.utils.chinese_tokenizer import digits, has_negation, normalize, tokenize
+    from app.utils.chinese_tokenizer import digits, has_negation, tokenize
 
     print("\n[A1] 分词")
     tokens = tokenize("这个项目的技术架构是什么")

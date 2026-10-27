@@ -45,6 +45,14 @@ SAMPLE = """# 家庭年度预算与理财计划
 """
 
 
+def conversation_ids() -> set:
+    """当前所有会话 id（用来跑完只删自己新建的，不动用户已有会话）"""
+    import httpx
+
+    resp = httpx.get(f"{API}/conversations", params={"limit": 500}, timeout=30)
+    return {c["id"] for c in resp.json().get("items", [])}
+
+
 def main() -> int:
     SHOT_DIR.mkdir(exist_ok=True)
     # 内容必须唯一：索引层按内容 hash 去重，如果和知识库里已有文档完全一致，
@@ -57,6 +65,7 @@ def main() -> int:
     console_errors: list[str] = []
     page_errors: list[str] = []
     results: dict[str, bool] = {}
+    conv_before = conversation_ids()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -163,7 +172,7 @@ def main() -> int:
         canvas = page.locator("canvas")
         results["图谱canvas渲染"] = canvas.count() > 0
         page.screenshot(path=str(SHOT_DIR / "06-知识图谱.png"), full_page=True)
-        print(f"    截图: 06-知识图谱.png")
+        print("    截图: 06-知识图谱.png")
 
         browser.close()
 
@@ -185,6 +194,16 @@ def main() -> int:
                 print(f"  已清理测试文档 id={item['id']}")
     except Exception as exc:
         print(f"  清理测试文档失败: {exc}")
+
+    # 在问答页提问会真的建一条会话，不清掉就会留在用户侧边栏里
+    try:
+        import httpx
+
+        for cid in conversation_ids() - conv_before:
+            httpx.delete(f"{API}/conversations/{cid}", timeout=60)
+            print(f"  已清理测试会话 id={cid}")
+    except Exception as exc:
+        print(f"  清理测试会话失败: {exc}")
 
     # ---------- 汇总 ----------
     print("\n" + "=" * 56)

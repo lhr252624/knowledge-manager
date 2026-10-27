@@ -21,7 +21,6 @@ from pathlib import Path
 
 # 本文件在 backend/tests/ 下，把 backend/ 加进 sys.path 才能 import app
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import sys
 import time
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -219,6 +218,19 @@ def test_latency():
         check("重排命中 < 2000ms", rerank_ms < 2000, f"{rerank_ms:.0f} ms")
 
 
+def cleanup() -> None:
+    """清掉本次写入的合成缓存条目
+
+    seed() 一开始就会整体清空缓存，所以这里再清一次等于把状态还原成"空缓存"，
+    不会留下 answer 里写着"答案0：…"这种假条目让用户在界面上看到。
+    """
+    try:
+        removed = qa_cache_service.clear()
+        print(f"\n已清理本次写入的合成缓存 {removed} 条")
+    except Exception as exc:  # 清理失败不该把测试结论改成失败
+        print(f"\n清理合成缓存失败: {exc}")
+
+
 def main() -> int:
     print("=" * 70)
     print("问答缓存三层命中验证")
@@ -232,6 +244,7 @@ def main() -> int:
     test_storage()
     test_near()
     test_latency()
+    cleanup()
 
     print()
     print("=" * 70)

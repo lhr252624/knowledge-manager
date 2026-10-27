@@ -407,7 +407,7 @@ class QACacheService:
                 "semantic": 0.0,
             }
 
-        for idx, cand in sorted(candidates.items(), key=lambda kv: -kv[1]["lexical"]):
+        for _idx, cand in sorted(candidates.items(), key=lambda kv: -kv[1]["lexical"]):
             entry = cand["entry"]
             if cand["lexical"] < settings.qa_cache_similarity_threshold:
                 break
