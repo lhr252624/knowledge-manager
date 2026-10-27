@@ -51,6 +51,7 @@ $env:PLAYWRIGHT_BROWSERS_PATH="$root\.playwright"
 | `verify_history_ui.py` | 后端 + 前端 + Playwright | 侧栏会话列表、新对话、重命名、删除、刷新后仍在、缓存命中徽章，共 20 项 |
 | `verify_filename_ui.py` | 后端 + 前端 + Playwright | 文件名在检索结果/知识图谱里的展示与改名弹窗（自建样例文档，跑完自动清理），共 19 项 |
 | `ui_test.py` | 后端 + 前端 + Playwright | 全流程走查（概览/上传/问答/检索/图谱）并截图到 `screenshots/` |
+| `verify_summary_agent.py` | 仅 LLM（不启动后端） | 摘要 Agent 的因果验证：把结论埋到 2500 字之后（旧实现必漏），断言新实现轨迹覆盖尾部且摘要采纳结论；另含步数上限、重复读取防护、reduce 兜底、短文档走单次，共 16 项 |
 
 ## 约定
 

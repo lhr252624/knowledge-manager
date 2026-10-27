@@ -153,10 +153,16 @@ class IndexAgent(BaseAgent):
                 try:
                     from app.agents.summary_agent import summary_agent
 
-                    summary_info = summary_agent.run(
+                    # 只取摘要与关键词，把 agent 的决策轨迹留在库里（summary_trace），
+                    # 不往索引结果里塞，保持这里的返回结构与以前一致
+                    info = summary_agent.run(
                         text=text, filename=filename, persist=True,
                         document_id=document_id,
                     )
+                    summary_info = {
+                        "summary": info.get("summary", ""),
+                        "keywords": info.get("keywords", []),
+                    }
                 except Exception as exc:  # 摘要失败不影响文档可检索性
                     logger.warning(f"摘要生成失败（文档仍可检索）: {exc}")
 

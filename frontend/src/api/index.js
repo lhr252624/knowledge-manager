@@ -33,6 +33,9 @@ export const getDocument = (id, withChunks = false) =>
 export const getDocumentContent = (id, maxChars = 20000) =>
   http.get(`/documents/${id}/content`, { params: { max_chars: maxChars } })
 
+// 摘要 Agent 的决策轨迹：读了哪几段、每步累计多少字
+export const getSummaryTrace = (id) => http.get(`/documents/${id}/summary-trace`)
+
 export const deleteDocument = (id) => http.delete(`/documents/${id}`)
 
 export const reindexDocument = (id) => http.post(`/documents/${id}/reindex`)
@@ -80,7 +83,7 @@ export const clearCache = (params) => http.delete('/cache', { params })
 export const getGraph = (params) => http.get('/graph', { params })
 
 /* ---------------- 流式问答 (SSE) ---------------- */
-export async function askQuestionStream(payload, { onMeta, onDelta, onDone, onError } = {}) {
+export async function askQuestionStream(payload, { onMeta, onStep, onDelta, onDone, onError } = {}) {
   try {
     const response = await fetch('/api/v1/qa/stream', {
       method: 'POST',
@@ -125,6 +128,7 @@ export async function askQuestionStream(payload, { onMeta, onDelta, onDone, onEr
         }
 
         if (event === 'meta') onMeta?.(data)
+        else if (event === 'step') onStep?.(data)
         else if (event === 'delta') onDelta?.(data.text || '')
         else if (event === 'error') onError?.(data.message || '未知错误')
         else if (event === 'done') onDone?.(data)

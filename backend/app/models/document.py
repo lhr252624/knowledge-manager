@@ -48,6 +48,11 @@ class Document(Base):
     title: Mapped[Optional[str]] = mapped_column(String(512), comment="标题")
     summary: Mapped[Optional[str]] = mapped_column(Text, comment="摘要")
     keywords: Mapped[Optional[str]] = mapped_column(Text, comment="关键词，JSON 数组")
+    # 摘要 agent 的决策轨迹：[{step, action, observation, chars}, ...]
+    # 存下来是为了能回答"它到底读了哪几段"，否则 agent 的行为无法复盘
+    summary_trace: Mapped[Optional[str]] = mapped_column(
+        Text, comment="摘要 ReAct 过程轨迹，JSON 数组"
+    )
     char_count: Mapped[int] = mapped_column(Integer, default=0, comment="正文字符数")
     chunk_count: Mapped[int] = mapped_column(Integer, default=0, comment="分块数量")
 

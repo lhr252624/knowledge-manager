@@ -161,6 +161,44 @@ def get_document_content(
     }
 
 
+@router.get("/{document_id}/summary-trace", summary="摘要 Agent 的决策轨迹")
+def get_summary_trace(document_id: int):
+    """
+    返回摘要生成时 ReAct 循环的每一步：调了哪个工具、看到什么、累计读了多少字
+
+    存在的意义：agent 的行为不可复现，必须能复盘"它到底读了哪几段"，
+    否则摘要错了都没法定位是没读到，还是读到了却理解错。
+    """
+    import json
+
+    from app.db.database import session_scope
+    from app.models.document import Document
+
+    with session_scope() as db:
+        doc = db.get(Document, document_id)
+        if doc is None:
+            raise HTTPException(status_code=404, detail="文档不存在")
+        raw = doc.summary_trace
+        summary = doc.summary
+        keywords = doc.keywords
+
+    trace = []
+    if raw:
+        try:
+            trace = json.loads(raw)
+        except json.JSONDecodeError:
+            trace = []
+
+    return {
+        "document_id": document_id,
+        "summary": summary,
+        "keywords": json.loads(keywords) if keywords else [],
+        "mode": "react" if trace else "single",
+        "steps": len(trace),
+        "trace": trace,
+    }
+
+
 @router.patch("/{document_id}", summary="修改文件名或标题")
 def update_document(document_id: int, req: DocumentUpdateRequest):
     """

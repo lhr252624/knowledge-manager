@@ -79,6 +79,9 @@ def _ensure_columns() -> None:
             "vector": "LONGBLOB NULL COMMENT '问题向量 float32（L2 归一化）'",
             "vector_model": "VARCHAR(128) NULL COMMENT '生成向量的模型标识'",
         },
+        "documents": {
+            "summary_trace": "TEXT NULL COMMENT '摘要 ReAct 过程轨迹，JSON 数组'",
+        },
     }
     for table, columns in wanted.items():
         try:

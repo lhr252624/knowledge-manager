@@ -85,6 +85,19 @@
           <template #default="{ row }">{{ formatSize(row.file_size) }}</template>
         </el-table-column>
         <el-table-column prop="chunk_count" label="分块" width="70" />
+        <el-table-column label="摘要" min-width="230">
+          <template #default="{ row }">
+            <!-- 摘要是入库时由 ReAct agent 生成的，点击看完整内容与决策轨迹 -->
+            <span
+              v-if="row.summary"
+              class="summary-cell"
+              :title="row.summary"
+              @click="openSummary(row)"
+            >{{ row.summary }}</span>
+            <span v-else-if="isPending(row.status)" class="summary-empty">生成中…</span>
+            <span v-else class="summary-empty">—</span>
+          </template>
+        </el-table-column>
         <el-table-column label="状态" width="110">
           <template #default="{ row }">
             <!-- 失败时把后端原因挂在 tooltip 上，否则用户只看到"失败"无从排查 -->
@@ -149,6 +162,59 @@
       <div class="doc-content">{{ drawerContent }}</div>
     </el-drawer>
 
+    <!-- 摘要：正文摘要 + 关键词 + agent 的决策轨迹 -->
+    <el-drawer v-model="summaryDrawer" :title="summaryTitle" size="46%">
+      <div v-loading="summaryLoading" class="summary-panel">
+        <div class="sum-block">
+          <div class="sum-label">摘要</div>
+          <div class="sum-text">{{ summaryData.summary || '（暂无摘要）' }}</div>
+        </div>
+
+        <div v-if="summaryData.keywords?.length" class="sum-block">
+          <div class="sum-label">关键词</div>
+          <div class="sum-tags">
+            <el-tag
+              v-for="k in summaryData.keywords"
+              :key="k"
+              size="small"
+              effect="plain"
+              type="info"
+            >{{ k }}</el-tag>
+          </div>
+        </div>
+
+        <div class="sum-block">
+          <div class="sum-label">
+            生成过程
+            <span class="sum-meta">
+              {{ summaryData.mode === 'react' ? 'ReAct 工具循环' : '单次生成' }}
+              <template v-if="summaryData.steps"> · {{ summaryData.steps }} 步</template>
+              <template v-if="readTimes"> · 读取 {{ readTimes }} 次 / 累计 {{ totalChars }} 字</template>
+            </span>
+          </div>
+
+          <el-timeline v-if="steps.length" class="sum-timeline">
+            <el-timeline-item
+              v-for="(s, i) in steps"
+              :key="i"
+              :type="stepType(s.action)"
+              size="normal"
+            >
+              <div class="step-title">{{ stepText(s) }}</div>
+              <div v-if="stepDesc(s)" class="step-desc">{{ stepDesc(s) }}</div>
+              <div v-if="s.chars" class="step-chars">累计读取 {{ s.chars }} 字</div>
+            </el-timeline-item>
+          </el-timeline>
+
+          <el-empty
+            v-else-if="!summaryLoading"
+            :image-size="56"
+            description="短文档走单次生成，没有工具调用"
+          />
+        </div>
+      </div>
+    </el-drawer>
+
     <!-- 改名：文件名参与检索（向量里带了名字前缀），所以改完要重算向量 -->
     <el-dialog v-model="renameVisible" title="修改文件名 / 标题" width="520px">
       <el-form label-width="76px">
@@ -188,6 +254,7 @@ import {
 import {
   deleteDocument,
   getDocumentContent,
+  getSummaryTrace,
   listDocuments,
   reindexDocument,
   updateDocument,
@@ -213,6 +280,69 @@ let disposed = false
 const drawer = ref(false)
 const drawerTitle = ref('')
 const drawerContent = ref('')
+
+/* ---------------- 摘要抽屉 ---------------- */
+const summaryDrawer = ref(false)
+const summaryTitle = ref('')
+const summaryLoading = ref(false)
+const summaryData = ref({ summary: '', keywords: [], mode: '', steps: 0, trace: [] })
+
+const steps = computed(() => summaryData.value.trace || [])
+// 读取次数：轨迹里 read_chunks 出现的次数（一次可能读多块）
+const readTimes = computed(() => steps.value.filter((s) => s.action === 'read_chunks').length)
+const totalChars = computed(() => Math.max(0, ...steps.value.map((s) => s.chars || 0)))
+
+const STEP_LABELS = {
+  get_outline: '查看文档结构',
+  finish: '提交摘要',
+  thought: '思考（未调用工具）',
+  reduce_fallback: '预算用尽，用已读内容收尾'
+}
+
+function stepText(s) {
+  const action = s.action || ''
+  if (action === 'read_chunks') {
+    const start = Number(s.args?.start ?? 0) + 1
+    const end = Number(s.args?.end ?? 0) + 1
+    return start === end ? `读取第 ${start} 块` : `读取第 ${start}~${end} 块`
+  }
+  if (action === 'search_in_document') return `文档内检索「${s.args?.query || ''}」`
+  return STEP_LABELS[action] || action
+}
+
+function stepDesc(s) {
+  if (s.action === 'get_outline') return String(s.observation || '').split('\n')[0]
+  if (s.action === 'thought') return s.observation || ''
+  return ''
+}
+
+function stepType(action) {
+  if (action === 'finish') return 'success'
+  if (action === 'reduce_fallback') return 'warning'
+  if (action === 'thought') return 'info'
+  return 'primary'
+}
+
+async function openSummary(row) {
+  summaryTitle.value = row.title || row.filename
+  // 先用列表里的摘要占位，轨迹随后补上，避免抽屉空白一瞬
+  summaryData.value = {
+    summary: row.summary || '',
+    keywords: [],
+    mode: '',
+    steps: 0,
+    trace: []
+  }
+  summaryDrawer.value = true
+  summaryLoading.value = true
+  try {
+    summaryData.value = await getSummaryTrace(row.id)
+  } catch {
+    /* 错误提示由 api 拦截器统一处理 */
+  } finally {
+    summaryLoading.value = false
+  }
+}
 
 const renameVisible = ref(false)
 const renaming = ref(false)
@@ -492,4 +622,45 @@ onBeforeUnmount(() => {
 }
 .pager { display: flex; justify-content: flex-end; margin-top: 12px; }
 .doc-content { white-space: pre-wrap; line-height: 1.9; font-size: 14px; }
+
+/* ---------------- 摘要列与摘要抽屉 ---------------- */
+.summary-cell {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: #4b5563;
+  cursor: pointer;
+}
+.summary-cell:hover { color: #3b82f6; }
+.summary-empty { color: #c0c4cc; font-size: 12px; }
+
+.summary-panel { min-height: 120px; }
+.sum-block { margin-bottom: 22px; }
+.sum-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: #374151;
+  margin-bottom: 10px;
+}
+.sum-meta { font-weight: 400; color: #9ca3af; margin-left: 8px; font-size: 12px; }
+.sum-text {
+  font-size: 14px;
+  line-height: 1.9;
+  color: #1f2937;
+  white-space: pre-wrap;
+}
+.sum-tags { display: flex; flex-wrap: wrap; gap: 8px; }
+.sum-timeline { padding-left: 2px; }
+.step-title { font-size: 13px; color: #111827; font-weight: 550; }
+.step-desc {
+  font-size: 12px;
+  color: #6b7280;
+  margin-top: 3px;
+  line-height: 1.6;
+  word-break: break-word;
+}
+.step-chars { font-size: 11px; color: #c0c4cc; margin-top: 2px; }
 </style>
