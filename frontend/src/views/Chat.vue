@@ -535,7 +535,9 @@ function stepText(s) {
   if (tool === 'list_documents') return '列出所有文档'
   if (tool === 'query_plan') {
     const s = args.strategy || 'direct'
-    return `规划：${s}${args.sub_queries && args.sub_queries.length ? `（${args.sub_queries.length} 个子问题）` : ''}`
+    const n = args.sub_queries ? args.sub_queries.length : 0
+    const unit = s === 'decompose' ? '个子问题' : '条检索式'
+    return `规划：${s}${n ? `（${n} ${unit}）` : ''}`
   }
   if (tool === 'router') {
     const label = { greeting: '问候', identity: '身份', capability: '能力', thanks: '致谢', bye: '告别' }
