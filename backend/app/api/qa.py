@@ -206,6 +206,8 @@ async def question_answer_stream(req: QARequest, background_tasks: BackgroundTas
 
     # 相关度低于下限（或模型已放弃检索）：不调模型，直接回固定话术
     refusal = hit is None and bool(prepared.get("refusal"))
+    # 寒暄/身份类：固定话术，不检索也不生成
+    social = "" if hit is not None else (prepared.get("social") or "")
 
     meta = {
         "citations": hit["citations"] if hit is not None else prepared["citations"],
@@ -215,6 +217,9 @@ async def question_answer_stream(req: QARequest, background_tasks: BackgroundTas
         "cache": _cache_payload(hit) if hit else None,
         "near": near,
     }
+    if social:
+        meta["citations"] = []
+        meta["retrieved"] = 0
     if refusal:
         # 拒答时不要把"检索到但没用上"的片段当引用展示，否则前端会挂在一条
         # "没找到相关内容"的答案下面显示来源卡片
@@ -245,6 +250,10 @@ async def question_answer_stream(req: QARequest, background_tasks: BackgroundTas
             background_tasks.add_task(
                 qa_cache_service.mark_hit, hit["cache_id"], hit["similarity"]
             )
+        elif social:
+            text = prepared.get("answer") or "你好！我是这套知识库的问答助手，直接问我就行。"
+            answer_parts.append(text)
+            yield _sse("delta", json.dumps({"text": text}, ensure_ascii=False))
         elif refusal:
             text = "知识库中没有找到与该问题相关的内容。可以换一种问法，或先上传相关文档。"
             answer_parts.append(text)
@@ -271,7 +280,7 @@ async def question_answer_stream(req: QARequest, background_tasks: BackgroundTas
         answer = "".join(answer_parts).strip()
 
         # 生成后自检：规则命中才重写一次（前端已看到初稿，重写后用 replace 事件替换）
-        if hit is None and not refusal and answer:
+        if hit is None and not refusal and not social and answer:
             try:
                 fixed, review = await asyncio.to_thread(
                     qa_agent.review_answer, req.question, answer, prepared["chunks"], prepared.get("scope", "")
@@ -291,7 +300,7 @@ async def question_answer_stream(req: QARequest, background_tasks: BackgroundTas
 
         citations = hit["citations"] if hit is not None else prepared["citations"]
 
-        if answer and hit is None and req.use_cache and not req.document_ids:
+        if answer and hit is None and not social and req.use_cache and not req.document_ids:
             try:
                 qa_cache_service.store(req.question, answer, citations)
             except Exception as exc:

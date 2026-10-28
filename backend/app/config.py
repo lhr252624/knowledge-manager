@@ -114,6 +114,12 @@ class Settings(BaseSettings):
     # 不再按分数闸门决定"要不要用 agent"：全部走证据收集循环，用延迟换质量。
     # 想要旧的快速路径就置 False（简单问题单次检索直接作答）
     qa_agent_always: bool = True
+    # 证据已经足够时提前收手、不再进工具循环（省 5~10 秒）：
+    # 规划为 direct、命中分 ≥ early_exit_score、片段数 ≥ early_exit_chunks、
+    # 问法不是"对比/列举"类，四条同时满足才跳过。
+    qa_agent_early_exit_enabled: bool = True
+    qa_agent_early_exit_score: float = 0.72
+    qa_agent_early_exit_chunks: int = 4
     # 工具调用传输方式：local（直接调用，默认）| mcp（通过 MCP 协议调用）
     # mcp 为实验特性：Windows 上 search_kb（加载 BGE 模型）会在 stdio 子进程里卡死，
     # 生产环境请保持 local。外部宿主直接连 mcp_server.py 不受影响。

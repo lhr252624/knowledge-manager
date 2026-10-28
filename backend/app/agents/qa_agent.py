@@ -104,6 +104,67 @@ def detect_format(question: str) -> str:
     return "default"
 
 
+# ---------------- 意图分诊 ----------------
+# 寒暄、身份、能力这类问题没有"知识库内容"可查，走检索只会把无关片段翻出来，
+# 再用 20 秒写一篇解释。这里用纯规则先分诊（零成本），命中就直接回固定话术。
+_INTENT_RULES = (
+    ("bye", re.compile(r"^(再见|拜拜|bye|晚安|先这样|下次聊|结束吧)[\s，,。.!！?？~]*$", re.I)),
+    ("thanks", re.compile(r"^(谢谢|多谢|感谢|谢了|辛苦(了|啦)?|thanks|thank you|thx)(您|你|啦|了)?[\s，,。.!！?？~]*$", re.I)),
+    ("identity", re.compile(r"(你是谁|你叫什么|你的名字|你是什么(人|东西|角色)?|介绍一下你(自己)?|自我介绍|你是(机器人|助手|AI|程序)吗)")),
+    ("capability", re.compile(r"(你能做(什么|啥)|你会(做)?什么|能帮我做(什么|啥)|有什么(功能|能力)|怎么用你|你可以干(什么|啥)|你能干什么)")),
+    ("greeting", re.compile(r"^(hi|hello|hey|嗨|哈喽|哈啰|你好|您好|在吗|在么|早|早上好|中午好|下午好|晚上好|早安)[\s，,。.!！?？~]*$", re.I)),
+)
+# 寒暄类只认"整句就是寒暄"，避免"你好，帮我看下这篇"被误判
+_INTENT_MAX_LEN = 12
+
+_SOCIAL_REPLY = {
+    "greeting": (
+        "你好！我是这套知识库的问答助手。直接把问题说给我就行——"
+        "比如「某份文档讲了什么」「某个流程怎么做」「两份方案怎么选」。"
+        "我会在你的资料里检索后作答，并标出来源。"
+    ),
+    "identity": (
+        "我是这套知识库的问答助手，不是资料里的某个人。"
+        "你提问，我在你上传的文档里检索，按资料作答并给出来源编号；"
+        "资料里没有的，我会直接说「知识库里没有」，不会编。"
+    ),
+    "capability": (
+        "我能做这几件事：按问题检索知识库并作答（带来源）；对比、总结几份文档；"
+        "按你指定的形式输出（关键词、结论、分点）。"
+        "检索只用已上传的资料，不查外部知识——所以先确认相关文档已入库。"
+    ),
+    "thanks": "不客气。还有问题随时问。",
+    "bye": "好的，回头见。",
+}
+
+
+def detect_intent(question: str) -> str:
+    """
+    分诊：greeting / identity / capability / thanks / bye，普通问题返回 ""
+
+    只做一件自己不会做错的事——把"没有知识库内容可查"的输入挡在检索之外。
+    看不懂的（长句、带具体指代）一律交回正常链路，宁可多花时间也不误判。
+    """
+    q = (question or "").strip()
+    if not q or len(q) > _INTENT_MAX_LEN:
+        return ""
+    for name, pattern in _INTENT_RULES:
+        if pattern.search(q):
+            return name
+
+    # 组合寒暄："hi，你好" / "你好，在吗" / "嗨 早" —— 每段都是问候才算
+    parts = [p for p in re.split(r"[\s，,。.!！?？~、]+", q) if p]
+    greeting = dict(_INTENT_RULES)["greeting"]
+    fillers = {"呀", "啊", "呢", "哈", "哦", "喔"}
+    if len(parts) >= 2 and all(greeting.search(p) or p in fillers for p in parts):
+        return "greeting"
+    return ""
+
+
+def social_reply(intent: str) -> str:
+    return _SOCIAL_REPLY.get(intent, "")
+
+
 # ---------------- 上下文组装 ----------------
 # 一次回答最多采用几篇文档、每篇最多几段
 _CTX_MAX_DOCS = 3
@@ -732,7 +793,43 @@ class QAAgent(BaseAgent):
         "总结", "概述", "全文", "通读", "对比", "区别", "哪个更好",
         "都有哪些", "有哪些", "列出", "分别有",
     )
+    # 这些问法天然需要多轮检索，不适用"证据够了就跳过循环"的早退
+    _MULTI_GOAL_WORDS = (
+        "对比", "比较", "分别", "区别", "差异", "哪些", "列出", "梳理",
+        "总结", "优缺点", "几个方面",
+    )
     _REFER_WORDS = ("那", "这", "它", "他们", "其中", "上面", "刚才", "前面")
+
+    def _evidence_enough(
+        self,
+        question: str,
+        chunks: List[Dict[str, Any]],
+        plan: Optional[Dict[str, Any]],
+    ) -> bool:
+        """
+        证据已经足够好时，不必再进工具循环
+
+        qa_agent_always 打开后所有问题都会走循环，代价是每次多 2~3 轮模型往返
+        （5~10 秒）；但"问题就是某份文档里的某件事、首轮检索已经命中"这类情况，
+        循环只是把同样的片段再捡一遍。这里用可解释的条件提前收手：
+        规划是 direct、命中分数够高、片段数够多、问法不是"对比/列举"。
+        """
+        if not settings.qa_agent_early_exit_enabled:
+            return False
+        if not chunks:
+            return False
+        if (plan or {}).get("strategy") != "direct":
+            return False
+        q = question or ""
+        if any(w in q for w in self._MULTI_GOAL_WORDS):
+            return False
+        if len(chunks) < int(settings.qa_agent_early_exit_chunks):
+            return False
+        try:
+            top = max(float(c.get("score") or 0.0) for c in chunks)
+        except (TypeError, ValueError):
+            return False
+        return top >= float(settings.qa_agent_early_exit_score)
 
     def _needs_agent(
         self,
@@ -884,7 +981,44 @@ class QAAgent(BaseAgent):
         agent 关闭或循环异常时同样退回单次结果——任何情况下都不该比改造前更差。
         """
         top_k = int(top_k or settings.search_top_k)
-        plan = self._plan_query(question, history)
+
+        # 分诊先于检索：寒暄/身份类问题没有资料可查，不该为它付检索、
+        # 规划、循环、提纲的钱（实测一次寒暄要走 5 次模型往返、20 秒）
+        intent = detect_intent(question)
+        if intent:
+            return {
+                "chunks": [],
+                "steps": [
+                    {
+                        "step": "intent",
+                        "tool": "router",
+                        "args": {"intent": intent},
+                        "observation": "寒暄/身份类，直接答，不检索",
+                    }
+                ],
+                "queries": [],
+                "gave_up": False,
+                "degraded": False,
+                "social": intent,
+                "plan": {
+                    "strategy": "direct",
+                    "sub_queries": [],
+                    "scope": "kb",
+                    "reason": "寒暄/身份类",
+                },
+            }
+
+        # 形式类请求（关键词/一句话）本来就走单次检索，没必要先花一次规划调用
+        fmt = detect_format(question)
+        if fmt in ("keywords", "short") and not force_agent:
+            plan: Dict[str, Any] = {
+                "strategy": "direct",
+                "sub_queries": [],
+                "scope": "kb",
+                "reason": "形式类请求，直接检索",
+            }
+        else:
+            plan = self._plan_query(question, history)
         base = self._retrieve_planned(question, plan, top_k, document_ids, use_name_match)
 
         if not settings.qa_agent_enabled and not force_agent:
@@ -895,7 +1029,16 @@ class QAAgent(BaseAgent):
                 "gave_up": False,
                 "degraded": True,
             }
-        elif not force_agent and detect_format(question) in ("keywords", "short"):
+        elif not force_agent and fmt in ("keywords", "short"):
+            solved = {
+                "chunks": base,
+                "steps": [],
+                "queries": [],
+                "gave_up": False,
+                "gated": True,
+            }
+        elif not force_agent and self._evidence_enough(question, base, plan):
+            # 证据已经足够：再走循环只是多花 5~10 秒把同样的片段再捡一遍
             solved = {
                 "chunks": base,
                 "steps": [],
@@ -1057,6 +1200,17 @@ class QAAgent(BaseAgent):
         solved = self.collect(question, history, top_k, document_ids, use_name_match)
         chunks = solved["chunks"]
         steps = list(solved["steps"])
+
+        # 寒暄/身份类：固定话术直接返回，不检索、不生成、不带引用
+        if solved.get("social"):
+            return {
+                "question": question,
+                "answer": social_reply(solved["social"]),
+                "citations": [],
+                "retrieved": 0,
+                "steps": steps,
+                "queries": [],
+            }
 
         if not chunks:
             return {
@@ -1267,6 +1421,12 @@ class QAAgent(BaseAgent):
             yield "问题不能为空"
             return
 
+        # 寒暄/身份类：固定话术，不走检索与生成
+        social = kwargs.get("social") or ""
+        if social:
+            yield social_reply(social)
+            return
+
         top_k = int(kwargs.get("top_k") or settings.search_top_k)
         document_ids = kwargs.get("document_ids")
         use_name_match = kwargs.get("use_name_match", True)
@@ -1337,6 +1497,8 @@ class QAAgent(BaseAgent):
             "outline": outline,
             "scope": plan.get("scope", ""),
             "plan": plan,
+            "social": solved.get("social") or "",
+            "answer": social_reply(solved["social"]) if solved.get("social") else "",
             "refusal": bool(chunks)
             and (
                 top_score < float(settings.qa_answer_floor)

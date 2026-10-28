@@ -505,6 +505,8 @@ const STEP_ICONS = {
   search_by_filename: '📂',
   read_document: '📄',
   list_documents: '📚',
+  query_plan: '🧭',
+  router: '💬',
   finish: '✅',
   give_up: '❌',
   thought: '💭'
@@ -531,6 +533,14 @@ function stepText(s) {
     return `读取文档 ${args.document_id} 第 ${start + 1}~${end + 1} 块`
   }
   if (tool === 'list_documents') return '列出所有文档'
+  if (tool === 'query_plan') {
+    const s = args.strategy || 'direct'
+    return `规划：${s}${args.sub_queries && args.sub_queries.length ? `（${args.sub_queries.length} 个子问题）` : ''}`
+  }
+  if (tool === 'router') {
+    const label = { greeting: '问候', identity: '身份', capability: '能力', thanks: '致谢', bye: '告别' }
+    return `分诊：${label[args.intent] || args.intent || '直接答'}`
+  }
   if (tool === 'finish') return `收集完成${args.reason ? `: ${args.reason}` : ''}`
   if (tool === 'give_up') return `未找到${args.reason ? `: ${args.reason}` : ''}`
   if (tool === 'thought') return '思考中'
