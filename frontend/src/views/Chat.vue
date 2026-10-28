@@ -107,7 +107,7 @@
             <div v-if="m.citations && m.citations.length" class="citations">
               <div class="citations-title">参考来源</div>
               <div
-                v-for="c in m.citations"
+                v-for="c in citeVisible(m, i)"
                 :key="c.index"
                 class="citation"
                 @click="openDoc(c.document_id)"
@@ -125,6 +125,13 @@
                   :title="matchTip(c)"
                 >{{ matchLabel(c).text }}</el-tag>
                 <span class="cite-score">{{ citeScore(c) }}</span>
+              </div>
+              <div
+                v-if="m.citations.length > CITE_LIMIT"
+                class="cite-toggle"
+                @click="toggleCite(i)"
+              >
+                {{ citeExpanded[i] ? '收起' : `展开全部 ${m.citations.length} 条` }}
               </div>
             </div>
           </div>
@@ -293,6 +300,20 @@ function citeScore(c) {
   return Number(c.score ?? 0).toFixed(2)
 }
 
+// 来源列表默认只显示前 4 条，其余折叠
+const CITE_LIMIT = 4
+const citeExpanded = ref({})
+
+function citeVisible(m, i) {
+  const all = m.citations || []
+  if (citeExpanded.value[i] || all.length <= CITE_LIMIT) return all
+  return all.slice(0, CITE_LIMIT)
+}
+
+function toggleCite(i) {
+  citeExpanded.value[i] = !citeExpanded.value[i]
+}
+
 function cacheTip(m) {
   const method = methodLabel(m.method)
   if (m.method === 'rerank') {
@@ -389,6 +410,7 @@ async function openConversation(c) {
   try {
     const data = await getConversation(c.id)
     currentId.value = data.id
+    citeExpanded.value = {}
     messages.value = (data.messages || []).map(toMessage)
     router.replace(`/chat/${data.id}`)
     scrollToBottom()
@@ -400,6 +422,7 @@ async function openConversation(c) {
 function newChat() {
   if (streaming.value) return
   currentId.value = null
+  citeExpanded.value = {}
   messages.value = []
   question.value = ''
   router.replace('/chat')
@@ -889,6 +912,17 @@ onMounted(async () => {
 .cite-title { color: #374151; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cite-file { color: #9ca3af; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cite-score { color: #9ca3af; }
+.cite-toggle {
+  width: fit-content;
+  margin-top: 2px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  font-size: 12px;
+  color: #6b7280;
+  cursor: pointer;
+  user-select: none;
+}
+.cite-toggle:hover { background: #f3f4f6; color: #3b82f6; }
 
 /* Agent 步骤时间线 */
 .agent-steps {
