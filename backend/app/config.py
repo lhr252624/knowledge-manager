@@ -125,7 +125,9 @@ class Settings(BaseSettings):
     # 名称相似度达到该值即视为"文件名命中"，参与加分与保底召回
     filename_match_threshold: float = 0.45
     # 名称强命中（保底入选）阈值
-    filename_strong_threshold: float = 0.6
+    # 0.6 太低：只要共享一个 4 字前缀（"人工智能-简历参考" vs 问"人工智能面试宝典"）
+    # 就能顶到第一位。0.75 只让"整名基本命中"的文档享受保底位。
+    filename_strong_threshold: float = 0.75
     # 文件名命中时给向量分加的最大分值（与实际名称相似度相乘）
     filename_boost: float = 0.20
     # 知识图谱里"文件名关联"边的连边阈值

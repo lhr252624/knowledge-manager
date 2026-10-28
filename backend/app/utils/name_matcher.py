@@ -171,12 +171,18 @@ def similarity(query: NameKey, name: NameKey) -> float:
 
     # 4. 提问恰好就是名字里的某一段（"周报" ← "周报-知识库项目进展"）
     best = 0.0
+    name_len = max(1, len(nn))
     for seg in segs:
         if seg == qn:
             best = max(best, 0.94)
         elif len(seg) >= MIN_SEGMENT_IN_QUERY and seg in qn:
-            # 长片段被提问包含，长度越长越可信
-            best = max(best, 0.90 if len(seg) >= 4 else 0.85)
+            # 长片段被提问包含时，按"这段覆盖了文件名多少"折算：
+            # "人工智能-简历参考"只共享前缀"人工智能"（4/8），
+            # 和"人工智能面试宝典"这种整名命中不该同分——否则问 A 文档
+            # 时同系列的 B 文档会一起被当成"文件名命中"顶到最前面。
+            cover = min(1.0, len(seg) / name_len)
+            base = 0.90 if len(seg) >= 4 else 0.85
+            best = max(best, base * (0.55 + 0.45 * cover))
         elif (
             len(seg) == 2
             and seg in qn
@@ -185,7 +191,9 @@ def similarity(query: NameKey, name: NameKey) -> float:
             # 两字片段（如"周报"）只在非泛词时算弱命中
             best = max(best, 0.70)
 
-    # 5. 提问被名字包含（"知识库" ← "知识库项目进展"）
+    # 5. 提问被名字包含（"知识库" ← "知识库项目进展"）：用户打的是名字里的一段原话，
+    #    即使名字更长也是强信号，不再按覆盖度打折（否则"手写数字识别"这种
+    #    精确短语会因为名字长而被压成中等分）
     if len(qn) >= MIN_SEGMENT_IN_QUERY and qn in nn:
         best = max(best, 0.85)
 

@@ -118,12 +118,13 @@
                   <span v-if="showFilename(c)" class="cite-file">{{ c.filename }}</span>
                 </span>
                 <el-tag
-                  v-if="c.match_type && c.match_type !== 'vector'"
+                  v-if="matchLabel(c)"
                   size="small"
-                  type="warning"
+                  :type="matchLabel(c).type"
                   effect="plain"
-                >文件名命中</el-tag>
-                <span class="cite-score">{{ (c.score ?? 0).toFixed(2) }}</span>
+                  :title="matchTip(c)"
+                >{{ matchLabel(c).text }}</el-tag>
+                <span class="cite-score">{{ citeScore(c) }}</span>
               </div>
             </div>
           </div>
@@ -262,6 +263,34 @@ const METHOD_LABEL = {
 
 function methodLabel(method) {
   return METHOD_LABEL[method] || '相似'
+}
+
+// 引用片段的来源标记：只有真的按名字命中的才叫"文件名命中"，
+// 命中片段前后补进来的上下文标"相邻补全"——它们没有分数，不该显示 0.00
+const MATCH_LABEL = {
+  filename: { text: '文件名命中', type: 'warning' },
+  both: { text: '文件名+语义', type: 'warning' },
+  neighbor: { text: '相邻补全', type: 'info' },
+  read: { text: '阅读原文', type: 'success' }
+}
+
+function matchLabel(c) {
+  return MATCH_LABEL[c.match_type] || null
+}
+
+function matchTip(c) {
+  const tips = {
+    filename: '文件名或标题与提问高度匹配，但这条片段本身没参与语义打分',
+    both: '文件名匹配，同时语义检索也命中了这条片段',
+    neighbor: '为了保持段落连贯补进来的上下文，不参与打分（分数 = 命中片段的分数）',
+    read: '用 read_document 直接读取的原文片段，不参与打分'
+  }
+  return tips[c.match_type] || ''
+}
+
+function citeScore(c) {
+  if (c.match_type === 'neighbor' || c.match_type === 'read') return '—'
+  return Number(c.score ?? 0).toFixed(2)
 }
 
 function cacheTip(m) {
