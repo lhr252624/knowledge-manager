@@ -1,4 +1,5 @@
 """检索与问答 API（含语义缓存与历史对话落库）"""
+import asyncio
 import json
 import time
 from typing import Any, Dict, Optional
@@ -203,6 +204,9 @@ async def question_answer_stream(req: QARequest, background_tasks: BackgroundTas
             f"相似度 {hit['similarity']}"
         )
 
+    # 相关度低于下限（或模型已放弃检索）：不调模型，直接回固定话术
+    refusal = hit is None and bool(prepared.get("refusal"))
+
     meta = {
         "citations": hit["citations"] if hit is not None else prepared["citations"],
         "retrieved": len(hit["citations"] or []) if hit is not None else len(prepared["chunks"]),
@@ -211,9 +215,17 @@ async def question_answer_stream(req: QARequest, background_tasks: BackgroundTas
         "cache": _cache_payload(hit) if hit else None,
         "near": near,
     }
+    if refusal:
+        # 拒答时不要把"检索到但没用上"的片段当引用展示，否则前端会挂在一条
+        # "没找到相关内容"的答案下面显示来源卡片
+        meta["citations"] = []
+        meta["retrieved"] = 0
     if hit is None:
         meta["steps"] = prepared.get("steps") or []
         meta["degraded"] = bool(prepared.get("degraded"))
+        # 相关度信息给前端一个提示位（"资料可能不足"），不改变渲染
+        meta["top_score"] = prepared.get("top_score")
+        meta["low_relevance"] = bool(prepared.get("low_relevance"))
 
     async def event_generator():
         answer_parts = []
@@ -233,6 +245,10 @@ async def question_answer_stream(req: QARequest, background_tasks: BackgroundTas
             background_tasks.add_task(
                 qa_cache_service.mark_hit, hit["cache_id"], hit["similarity"]
             )
+        elif refusal:
+            text = "知识库中没有找到与该问题相关的内容。可以换一种问法，或先上传相关文档。"
+            answer_parts.append(text)
+            yield _sse("delta", json.dumps({"text": text}, ensure_ascii=False))
         else:
             try:
                 async for piece in qa_agent.astream(
@@ -242,6 +258,9 @@ async def question_answer_stream(req: QARequest, background_tasks: BackgroundTas
                     use_name_match=req.use_name_match,
                     history=history,
                     chunks=prepared["chunks"],
+                    low_relevance=meta.get("low_relevance", False),
+                    outline=prepared.get("outline", ""),
+                    scope=prepared.get("scope", ""),
                 ):
                     answer_parts.append(piece)
                     yield _sse("delta", json.dumps({"text": piece}, ensure_ascii=False))
@@ -250,6 +269,26 @@ async def question_answer_stream(req: QARequest, background_tasks: BackgroundTas
                 yield _sse("error", json.dumps({"message": str(exc)}, ensure_ascii=False))
 
         answer = "".join(answer_parts).strip()
+
+        # 生成后自检：规则命中才重写一次（前端已看到初稿，重写后用 replace 事件替换）
+        if hit is None and not refusal and answer:
+            try:
+                fixed, review = await asyncio.to_thread(
+                    qa_agent.review_answer, req.question, answer, prepared["chunks"], prepared.get("scope", "")
+                )
+            except Exception as exc:  # 自检失败不影响已发出的答案
+                logger.warning(f"答案自检失败: {exc}")
+                fixed, review = answer, {"issues": [], "repaired": False}
+            if review.get("repaired") and fixed != answer:
+                answer = fixed
+                yield _sse(
+                    "replace",
+                    json.dumps(
+                        {"text": fixed, "issues": review.get("issues") or []},
+                        ensure_ascii=False,
+                    ),
+                )
+
         citations = hit["citations"] if hit is not None else prepared["citations"]
 
         if answer and hit is None and req.use_cache and not req.document_ids:

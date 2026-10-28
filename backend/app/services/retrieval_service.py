@@ -18,6 +18,8 @@
     4. 名称强命中的文档保底占 1 个位置，避免被一堆弱相关的正文片段挤掉
 """
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from pathlib import Path
+import json
 
 from loguru import logger
 
@@ -25,6 +27,7 @@ from app.config import get_settings
 from app.db.database import session_scope
 from app.models.document import Document, DocumentStatus
 from app.services.milvus_store import milvus_store
+from app.services.rerank_service import rerank_service
 from app.utils.name_matcher import NameKey, match_score
 
 settings = get_settings()
@@ -35,6 +38,104 @@ MAX_NAME_SCAN = 2000
 
 def _hit_key(hit: Dict[str, Any]) -> Tuple[int, int]:
     return int(hit["document_id"]), int(hit["chunk_index"])
+
+
+_DUP_CACHE: Dict[str, Any] = {"mtime": None, "map": {}}
+
+
+def duplicate_map() -> Dict[int, int]:
+    """
+    读取"重复文档 -> 代表文档"映射（映射文件变了自动重载）
+
+    只处理"同一份文件传了两遍"这种真重复；同主题但内容不同的笔记不该被并，
+    所以阈值取 0.6（实测不同章节的复习笔记 Jaccard 只有 0.15~0.39）。
+    """
+    if not settings.retrieval_dedup_enabled:
+        return {}
+    path = Path(settings.retrieval_dedup_file)
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return {}
+    if _DUP_CACHE["mtime"] == mtime:
+        return _DUP_CACHE["map"]
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        mapping = {int(k): int(v) for k, v in (payload.get("duplicates") or {}).items()}
+    except Exception as exc:  # 映射坏了不影响检索
+        logger.warning(f"读取重复文档映射失败: {exc}")
+        mapping = {}
+
+    _DUP_CACHE["mtime"] = mtime
+    _DUP_CACHE["map"] = mapping
+    logger.info(f"重复文档映射已加载：{len(mapping)} 篇被降权")
+    return mapping
+
+
+def _final_key(hit: Dict[str, Any]) -> Tuple[int, float, float]:
+    """
+    最终排序键：重排被采纳时按重排分，否则按融合分
+
+    不能混着重排分和自然分布分数一起比：两者量纲不同，混排会让
+    "没参加重排的低分片段"莫名其妙跑到前面。
+    """
+    if not hit.get("rerank_applied"):
+        return (0, 0.0, float(hit.get("score") or 0))
+    return (1, float(hit.get("rerank_score") or 0), float(hit.get("score") or 0))
+
+
+def _rerank(query: str, hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    用交叉编码器把候选按"与问题的相关性"重排
+
+    向量召回是双塔：问题与段落各自编码，最后只做一次点积——它知道"两边像不像"，
+    但看不到词与词之间的关系，也分不清"提到了同一个词"和"确实在回答这个问题"。
+    交叉编码器把 (问题, 段落) 拼起来过一遍，判定质量高一个档，代价是每条一次前向
+    （约 40ms），所以只重排前 N 条，剩下的沿用向量排序。
+    """
+    if not settings.retrieval_rerank_enabled or len(hits) < 2:
+        return hits
+    if not rerank_service.ready:
+        logger.debug("重排模型未就绪，本次跳过段落重排")
+        return hits
+
+    n = min(len(hits), max(1, int(settings.retrieval_rerank_candidates)))
+    head, tail = hits[:n], hits[n:]
+    try:
+        scores = rerank_service.score_pairs(
+            [(query, (h.get("content") or "")[:900]) for h in head],
+            batch_size=int(settings.retrieval_rerank_batch_size),
+        )
+    except Exception as exc:  # 显存不足/模型异常时退回向量排序，不能让检索整体失败
+        logger.warning(f"段落重排失败，退回向量排序: {exc}")
+        return hits
+    if len(scores) != len(head):  # 推理异常时保持原序，不要清空结果
+        logger.warning("重排返回条数与候选不一致，跳过重排")
+        return hits
+
+    for hit, score in zip(head, scores):
+        hit["rerank_score"] = round(float(score), 4)
+
+    # 重排分数本身是"这条资料在不在回答这个问题"的判据，但它对**问得太泛**的问题
+    # 会集体给低分（实测"介绍一下agent"最高只有 0.10，而具体问题能到 0.8~0.97）。
+    # 这种情况按重排分排序会把原本靠前的正确片段压到后面，所以置信不足时保持向量顺序。
+    best = max(scores)
+    if best < float(settings.retrieval_rerank_min_confident):
+        logger.debug(
+            f"重排最高分仅 {best:.3f}（< {settings.retrieval_rerank_min_confident}），"
+            f"置信不足，保持向量顺序"
+        )
+        return hits
+
+    for hit in head:
+        hit["rerank_applied"] = True
+    head.sort(key=lambda h: (-float(h["rerank_score"]), -float(h.get("score") or 0)))
+    logger.debug(
+        f"重排 {len(head)} 条：最高 {head[0]['rerank_score']:.3f} / "
+        f"最低 {head[-1]['rerank_score']:.3f}"
+    )
+    return head + tail
 
 
 def name_matches(
@@ -157,6 +258,20 @@ def retrieve(
             deduped[k] = hit
     ranked = sorted(deduped.values(), key=lambda h: h["score"], reverse=True)
 
+    # 融合打分算完后，把"重复上传的副本"压下去，避免同一篇文档占满上下文
+    dups = duplicate_map()
+    if dups:
+        penalty = float(settings.retrieval_dedup_penalty)
+        for hit in ranked:
+            rep = dups.get(int(hit["document_id"]))
+            if rep is not None:
+                hit["duplicate_of"] = rep
+                hit["score"] = round(float(hit["score"]) * penalty, 4)
+        ranked.sort(key=lambda h: h["score"], reverse=True)
+
+    # ---------- 4.5 交叉编码器重排 ----------
+    ranked = _rerank(query, ranked)
+
     # ---------- 5. 名称强命中文档保底 ----------
     strong_docs = [
         d
@@ -183,7 +298,7 @@ def retrieve(
         final.append(hit)
         used.add(k)
 
-    final.sort(key=lambda h: h["score"], reverse=True)
+    final.sort(key=_final_key, reverse=True)
 
     if matched:
         summary = ", ".join(

@@ -96,15 +96,22 @@ class RerankService:
             logger.warning(f"重排模型加载失败，问答缓存退化为词面匹配: {exc}")
 
     # ---------- 推理 ----------
-    def score_pairs(self, pairs: Sequence[Tuple[str, str]]) -> List[float]:
-        """给若干 (问题A, 问题B) 打分，返回 0~1；模型未就绪时返回空列表"""
+    def score_pairs(
+        self, pairs: Sequence[Tuple[str, str]], batch_size: Optional[int] = None
+    ) -> List[float]:
+        """给若干 (A, B) 打分，返回 0~1；模型未就绪时返回空列表
+
+        batch_size 不传时一次算完（缓存层只比几条短问句）；
+        检索重排的段落长得多，调用方要传一个小批（默认 8），否则显存会顶爆。
+        """
         if not pairs or not self.ready:
             return []
 
         import numpy as np
 
+        batch = max(1, int(batch_size or len(pairs)))
         with self.__class__._infer_lock:
-            raw = self._model.predict(list(pairs), batch_size=len(pairs))
+            raw = self._model.predict(list(pairs), batch_size=batch)
 
         values = np.asarray(raw, dtype=np.float32).reshape(-1)
         if self.__class__._needs_sigmoid:

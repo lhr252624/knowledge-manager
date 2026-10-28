@@ -83,7 +83,7 @@ export const clearCache = (params) => http.delete('/cache', { params })
 export const getGraph = (params) => http.get('/graph', { params })
 
 /* ---------------- 流式问答 (SSE) ---------------- */
-export async function askQuestionStream(payload, { onMeta, onStep, onDelta, onDone, onError } = {}) {
+export async function askQuestionStream(payload, { onMeta, onStep, onDelta, onDone, onReplace, onError } = {}) {
   try {
     const response = await fetch('/api/v1/qa/stream', {
       method: 'POST',
@@ -130,6 +130,7 @@ export async function askQuestionStream(payload, { onMeta, onStep, onDelta, onDo
         if (event === 'meta') onMeta?.(data)
         else if (event === 'step') onStep?.(data)
         else if (event === 'delta') onDelta?.(data.text || '')
+        else if (event === 'replace') onReplace?.(data.text || '', data.issues || [])
         else if (event === 'error') onError?.(data.message || '未知错误')
         else if (event === 'done') onDone?.(data)
       }

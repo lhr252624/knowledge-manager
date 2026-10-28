@@ -76,7 +76,9 @@ class Settings(BaseSettings):
 
     # ---------- 检索 ----------
     search_top_k: int = 5
-    score_threshold: float = 0.0
+    # 单条片段的向量分下限。0 表示不过滤——实测无关提问也能召回 0.47~0.60 的片段，
+    # 这些片段进了上下文只会诱导模型硬凑答案（"文件变更记录""参考简历"都曾混进来）
+    score_threshold: float = 0.35
 
     # ---------- 问答 agent ----------
     # True : 模型在工具循环里自己收集证据（可多次检索、换措辞重试、读整篇、跨文档）
@@ -87,6 +89,31 @@ class Settings(BaseSettings):
     # 单次检索的最高分低于该值时，认为"一次没搜好"，交给 agent 换措辞重搜。
     # 调高 = 更多问题走 agent（更准但更慢），调低 = 更多问题走单次检索（更快）
     qa_agent_score_gate: float = 0.55
+
+    # ---------- 问答：低相关度与生成后自检 ----------
+    # 最高向量分低于此值：不直接拒答，但在提示词里告诉模型"相关度低、答不了就说没找到"。
+    # 实测：无关提问 top1 在 0.42~0.60，真问题在 0.61~0.73，0.58 落在两者的重叠区
+    qa_low_relevance_gate: float = 0.58
+    # 低于此值直接回固定话术，不调模型（省 2~8 秒和一次费用）。宁可漏答，不要硬编
+    qa_answer_floor: float = 0.40
+    # 生成后自检：命中问题才触发一次重写，最多 1 次；关掉则只记日志不重写
+    qa_review_enabled: bool = True
+    # 作答前先列提纲：多一次小调用（约 1 秒），换来全局结构先定下来。
+    # 针对的是"每段都合理、放一起没逻辑"——先定骨架再写肉，比事后重写有效
+    qa_outline_enabled: bool = True
+    qa_outline_max_tokens: int = 320
+
+    # ---------- 问答：检索规划 ----------
+    # 先让模型判断"该怎么检索"，再执行。三种策略：
+    #   direct    直接拿问题检索（问题指向明确）
+    #   hyde      先生成一段假设答案，再拿这段答案去检索（问通用概念/抽象做法时，
+    #             知识库里的措辞往往和问题对不上，用"答案的语言"更容易召回）
+    #   decompose 拆成 2~4 个子问题分别检索再合并（多子目标、对比类问题）
+    qa_query_plan_enabled: bool = True
+    qa_hyde_max_tokens: int = 220
+    # 不再按分数闸门决定"要不要用 agent"：全部走证据收集循环，用延迟换质量。
+    # 想要旧的快速路径就置 False（简单问题单次检索直接作答）
+    qa_agent_always: bool = True
     # 工具调用传输方式：local（直接调用，默认）| mcp（通过 MCP 协议调用）
     # mcp 为实验特性：Windows 上 search_kb（加载 BGE 模型）会在 stdio 子进程里卡死，
     # 生产环境请保持 local。外部宿主直接连 mcp_server.py 不受影响。
@@ -130,8 +157,30 @@ class Settings(BaseSettings):
     qa_rerank_threshold: float = 0.995
     # 一次最多重排几条候选（每条约 40ms，控制在 3 条以内）
     qa_rerank_candidates: int = 3
-    # 重排模型的最大输入长度（问题都很短，128 足够）
-    qa_reranker_max_length: int = 128
+    # 重排模型的最大输入长度。同一个模型还用于检索阶段的"段落重排"，
+    # 段落（500 字）远长于问句，128 会把真正相关的那段截掉，所以放到 512。
+    # 短问句在 512 下不会被截断，缓存层的分数不受影响。
+    qa_reranker_max_length: int = 512
+
+    # ---------- 检索：交叉编码器重排 ----------
+    # 向量召回是"双塔"：问题与段落各自编码后只做一次点积，看不到词与词之间的关系。
+    # 加上交叉编码器重排（问题+段落拼起来过一遍模型），才能区分"提到了同一个词"和
+    # "确实在回答这个问题"。代价是每条约 40ms，所以只重排前 N 条。
+    retrieval_rerank_enabled: bool = True
+    retrieval_rerank_candidates: int = 12
+    # 重排最高分低于此值时认为"重排没有把握"（问题太泛或资料确实不相关），
+    # 保持向量顺序，避免把原本靠前的片段压下去。实测具体问题 0.8~0.97，泛问题 ≤0.10
+    retrieval_rerank_min_confident: float = 0.5
+    # 一次前向的批大小：段落长 512 token，批太大在 8GB 卡上会把显存顶爆
+    retrieval_rerank_batch_size: int = 8
+
+    # ---------- 检索：近重复文档降权 ----------
+    # 映射由 scripts/find_duplicate_docs.py 生成（字符 3-gram Jaccard），
+    # 只处理"同一份文件传了两遍"这种，阈值 0.6 以上才会被判重。
+    # 注意：不同章节的复习笔记 Jaccard 只有 0.15~0.39，不是重复，不该并。
+    retrieval_dedup_enabled: bool = True
+    retrieval_dedup_penalty: float = 0.5
+    retrieval_dedup_file: str = str(PROJECT_ROOT / "backend" / "data" / "doc_duplicates.json")
 
     # ---------- 历史对话 ----------
     history_max_conversations: int = 200

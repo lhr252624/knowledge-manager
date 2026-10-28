@@ -12,6 +12,8 @@ QAAgent - 知识库问答 agent
         问题 -> 向量召回 Top-K -> 构造上下文 -> LangChain Chain -> 答案
         agent 循环异常或超出预算时自动退化为这条路径，保证不会比原来更差。
 """
+import json
+import re
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from loguru import logger
@@ -29,18 +31,350 @@ _HISTORY_ANSWER_CHARS = 120
 
 _SYSTEM_PROMPT = """你是「智能知识管理系统」的问答助手。请严格依据用户提供的【参考资料】回答问题。
 
-回答要求：
-1. 只使用参考资料中的信息，不要编造。资料不足时明确说明"资料中未提及"。
-2. 用中文回答，条理清晰；涉及步骤或要点时使用列表。
-3. 在引用具体内容处用 [1] [2] 这样的编号标注来源，编号对应参考资料序号。
-4. 参考资料标题里标注了文档名（文件名）与标题。如果用户直接提到某个文档名，
-   请优先依据那份文档作答，并在回答开头点明是哪份文档。
-5. 如果提供了【对话历史】，结合上下文理解追问（例如"那第二点呢"），
+【最高优先级：形式服从请求】
+用户怎么要求形式，就怎么输出；用户的形式要求优先于下面所有默认格式。
+- 要"关键词"：只输出关键词本身，用「、」分隔，数量按用户说的（没说就给 3~5 个）；
+  不分类、不编号、不带金额与数字、不解释、不加结尾说明。
+- 要"一句话 / 简短 / 只要结论"：一到两句话，不超过 60 字。
+- 要"详细 / 展开 / 分步骤"：才使用列表，允许多段。
+- 没有指定形式：默认 200 字以内，先给结论再给依据。
+
+【资料一致性】
+落笔之前先判断：【参考资料】是否都在回答同一个问题。
+- 如果它们分属不同主题（例如一份讲概念、一份讲另一个项目），只采用与问题最相关的那一份，
+  其余不要采用，也不要在回答里提它们；更不要把不同主题的资料拼成一篇"大全"。
+- 如果资料只是零散提到、并没有系统介绍，就只回答能被支撑的部分，并明确说明
+  "知识库中没有关于 X 的系统介绍"，不要据此扩写成教科书式的长文。
+
+【结构】
+- 沿用资料本身的顺序和标题；不要为了显得完整而自造"一、二、三……"。
+- 每一节都必须带来新信息；两节讲同一件事就合并成一节。
+- 每一段只讲一个论点，段与段之间要有推进关系（是什么 → 怎么做 → 效果/边界），
+  不要用"另外""此外"把不相关的内容并列。
+- 引用标注挂在关键论断后面即可，一段最多一处，不要每句话都挂编号。
+
+【事实纪律】
+1. 只使用参考资料中的信息，不要编造。确实没有依据时用一句话说明"资料中未提及"，
+   不要逐条罗列缺了哪些内容。
+2. 在引用具体内容处用 [1] [2] 这样的编号标注来源，编号对应参考资料序号；
+   纯列举关键词时不需要标注。
+3. 参考资料标题里标注了文档名（文件名）与标题。用户点名了某份文档就直接作答，
+   不要复述文档名；没点名且涉及多篇时才说明依据哪一份。
+4. 如果提供了【对话历史】，结合上下文理解追问（例如"那第二点呢"），
    但事实依据仍然只能来自参考资料。
-6. 不要重复罗列资料原文，要归纳总结。
+5. 不要重复罗列资料原文，要归纳。
 """
 
 _USER_TEMPLATE = "{prompt}"
+
+# ---------------- 输出形式识别 ----------------
+# 只改提示词还不够：提示词里写"要简短"，模型仍然会写到 max_tokens 为止。
+# 所以这里把形式识别出来，既写进提示词，也用来卡生成长度（见 _FORMAT_MAX_TOKENS）。
+_FORMAT_KEYWORDS = re.compile(r"关键词|关键字|标签|几个词|提炼.{0,4}词")
+_FORMAT_SHORT = re.compile(
+    r"只要?结论|一句话|一两句|简短|简要|简单说|别展开|不要解释|不要正文|不需要解释|只给"
+)
+_FORMAT_DETAILED = re.compile(r"详细|展开|具体说明|分步骤|一步一步|完整说明|尽量全面")
+
+# 顺序有意义：先说"关键词"再说"简短的"，"只给我 5 个关键词"要落到 keywords
+_FORMAT_RULES = (
+    ("keywords", _FORMAT_KEYWORDS),
+    ("short", _FORMAT_SHORT),
+    ("detailed", _FORMAT_DETAILED),
+)
+
+# 各形式允许的输出上限（token）。中文约 1.5 字/token，全局默认 2048 太大了；
+# default 留 900 是给"对比/列清单"这类不指定形式但要展开的问题留余量，别把答案截断在半句
+_FORMAT_MAX_TOKENS = {"keywords": 120, "short": 200, "detailed": 1024, "default": 900}
+
+_FORMAT_HINTS = {
+    "keywords": "【输出形式】只输出关键词，用「、」分隔，3~5 个；不解释、不编号、不分段。",
+    "short": "【输出形式】一到两句话，60 字以内，不要列表。",
+    "detailed": "【输出形式】可以分点展开，但不要重复罗列原文。",
+    "default": "",
+}
+
+
+def detect_format(question: str) -> str:
+    """识别用户要的输出形式：keywords / short / detailed / default（纯规则，零成本）"""
+    q = (question or "").strip()
+    for name, pattern in _FORMAT_RULES:
+        if pattern.search(q):
+            return name
+    return "default"
+
+
+# ---------------- 上下文组装 ----------------
+# 一次回答最多采用几篇文档、每篇最多几段
+_CTX_MAX_DOCS = 3
+_CTX_MAX_CHUNKS_PER_DOC = 4
+# 每个文档最多补几个相邻片段
+_CTX_NEIGHBORS_PER_DOC = 3
+
+
+def order_chunks(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    把检索片段按"文档聚簇 + 文档内连续窗口"重排
+
+    检索结果是按分数排序的，同一篇文档的几个片段会被打散成 8/12/9/2 这种顺序，
+    提示词里也就按这个顺序给模型——模型据此重建叙事时必然前后错位，
+    这就是"看似答了很多、实际前言不搭后语"的直接原因。
+
+    这里改成：先按文档分组（组间按该文档的最高分降序）；组内以最高分片段为锚点，
+    向两侧优先取**连续**片段（凑成一段能读的原文），而不是再按分数跳着挑。
+    连续比"每条都高分"更重要：碎片读起来就是段落抄一半。
+    """
+    if not chunks:
+        return []
+
+    groups: Dict[int, List[Dict[str, Any]]] = {}
+    for c in chunks:
+        groups.setdefault(int(c["document_id"]), []).append(c)
+
+    best = lambda items: max(float(c.get("score") or 0) for c in items)  # noqa: E731
+    ranked = sorted(groups.items(), key=lambda kv: -best(kv[1]))
+
+    ordered: List[Dict[str, Any]] = []
+    for _, items in ranked[:_CTX_MAX_DOCS]:
+        by_idx: Dict[int, Dict[str, Any]] = {}
+        for c in items:
+            idx = int(c.get("chunk_index") or 0)
+            # 同一块可能有两条（向量/名称两路召回），留分高的
+            if idx not in by_idx or float(c.get("score") or 0) > float(
+                by_idx[idx].get("score") or 0
+            ):
+                by_idx[idx] = c
+
+        anchor = max(by_idx, key=lambda i: float(by_idx[i].get("score") or 0))
+        window = [anchor]
+        # 先往后扩（命中块通常只是开头，结论在后面），再往前补
+        for step in range(1, _CTX_MAX_CHUNKS_PER_DOC):
+            if anchor + step in by_idx:
+                window.append(anchor + step)
+            if len(window) >= _CTX_MAX_CHUNKS_PER_DOC:
+                break
+            if anchor - step in by_idx:
+                window.append(anchor - step)
+            if len(window) >= _CTX_MAX_CHUNKS_PER_DOC:
+                break
+
+        ordered.extend(by_idx[i] for i in sorted(window))
+    return ordered
+
+
+# ---------------- 作答提纲 ----------------
+# "每一段都合理、放在一起没逻辑"的根因是：模型是逐段看资料、逐段写，
+# 从头到尾没有定过"这一篇要论证什么"。所以先让它把骨架写出来，再按骨架填肉。
+_OUTLINE_SYSTEM = """你是答题规划员。你的任务不是写答案，而是先定一个能自洽的提纲。
+
+输出 3~5 行，每行格式：
+<序号>. <这一节要讲什么，必须是完整的一句话> | 依据: [资料编号,...]
+
+要求：
+- 第一行先给结论或定义，直接回答"问题到底在问什么"。
+- 后面几条要有推进关系（是什么 → 怎么做 → 效果/边界），不要照抄资料的小标题平铺。
+- 每条都要能落到具体资料编号；落不到依据的就不要写进提纲。
+- 只输出提纲，不要写正文，不要解释。"""
+
+_OUTLINE_TEMPLATE = """【参考资料】
+{context}
+
+【问题】
+{question}
+
+请给出提纲。"""
+
+_OUTLINE_HINT = """【作答提纲】（结构已定，请按它写）
+{outline}
+
+写作要求：一节一段、顺序不变；每节只讲这一件事；节与节之间要有衔接
+（递进、因果、转折），不要用「另外」「此外」把不相关的内容并列。
+提纲里某节如果资料支撑不足，就写「资料中未提及」，不要拿别的资料来填。"""
+
+
+# ---------------- 生成后自检 ----------------
+_SENT_SPLIT = re.compile(r"[。！？!?\n]+")
+
+_REPAIR_SYSTEM = """你是答案校对员。给你一个问题、一份答案、若干资料片段，以及校对员发现的问题。
+你的任务不是重写，而是**只修掉被指出的问题**，保留答案里正确、有依据的内容。
+
+铁律：
+- 不得引入资料里没有的新事实、新数字、新结论。
+- 不要换行文风格，不要扩写，不要加总结段。
+- 修不了（比如资料确实不足）就在对应位置改成"资料中未提及"，不要编。
+- 只输出修正后的答案正文，不要解释你改了什么。"""
+
+_REPAIR_TEMPLATE = """【问题】
+{question}
+
+【待校对答案】
+{answer}
+
+【校对员发现的问题】
+{issues}
+
+【资料片段（只能依据这些）】
+{context}
+
+请输出修正后的答案。"""
+
+
+# ---------------- 检索规划 ----------------
+# 同一个问题，检索方式不一样，召回的可能是完全不同的东西：
+#   问"详细讲讲 agent"——直接检索会把知识库里唯一的"简历审查 Agent"捞上来，
+#   于是回答全是一个具体项目的细节，用户问的却是通用概念。
+# 所以先让模型规划：换措辞(HyDE)、拆子问题(decompose)，还是直接查，以及
+# 这个问题到底在问"通用概念"还是"某个具体项目"。
+_QUERY_PLAN_SYSTEM = """你是检索规划员。给定用户问题（可能附带对话历史），你决定怎么在知识库里检索。
+
+三种策略：
+- direct：问题指向明确，直接拿问题去检索。
+- hyde：先写一段"假设的答案"，再拿这段答案去检索。
+        适合问的是通用概念/抽象做法，而知识库里很可能用另一套说法描述同一件事。
+- decompose：把问题拆成 2~4 个子问题，分别检索再合并。
+        适合一句话里有多个子目标、或需要对比的问题。
+
+同时判断问题的抽象层级：
+- kb：问题指向知识库里已有的具体项目或文档。
+- general：问的是通用概念/常识，知识库里可能只有一个具体实例，甚至没有。
+- mixed：既问通用概念，又要落到具体项目。
+
+只输出 JSON，不要解释，不要 markdown 代码块：
+{"strategy":"direct|hyde|decompose","sub_queries":["..."],"scope":"kb|general|mixed","reason":"一句话"}"""
+
+_QUERY_PLAN_TEMPLATE = """{history}【问题】{question}
+
+请输出检索计划 JSON。"""
+
+_HYDE_SYSTEM = "你是检索助手。你的任务不是回答用户，而是写一段用于检索的'假设答案'。"
+_HYDE_TEMPLATE = """针对下面的问题，用你自己的知识写一段 150 字以内的、像样的回答。
+不需要准确，也不要引用任何资料——它只用来当检索的语义桥梁。
+
+问题：{question}"""
+
+_JSON_OBJ_RE = re.compile(r"\{.*\}", re.S)
+
+_SCOPE_HINTS = {
+    "general": (
+        "【知识边界】用户问的是通用概念，而知识库里主要是具体项目文档。请分两层作答：\n"
+        "① 第一层「通用说明」：用你自己的知识把这个概念讲完整——是什么、由哪几部分组成、"
+        "有哪几种常见范式、按什么维度分类、通常用在什么场景。这一层不要依赖某个具体框架或项目，"
+        "提到框架只能当例子（写成「例如…」）。\n"
+        "② 第二层「知识库中的具体实现」：知识库里有哪些具体项目/文档、它们在这一点上怎么写、缺哪些。\n"
+        "不要把某个具体项目或框架的写法当成通用定义，也不要用具体项目的内容代替通用解释。"
+    ),
+    "mixed": (
+        "【知识边界】问题既涉及通用概念、又要落到具体项目。先给通用说明（标明「通用说明」），"
+        "再用知识库里的具体实现印证；两层要分清，不要混着讲。"
+    ),
+}
+
+
+def parse_plan(raw: str) -> Dict[str, Any]:
+    """容错解析规划 JSON，任何异常都退回 direct/kb"""
+    default = {"strategy": "direct", "sub_queries": [], "scope": "kb", "reason": ""}
+    match = _JSON_OBJ_RE.search(raw or "")
+    if not match:
+        return default
+    try:
+        data = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return default
+
+    strategy = str(data.get("strategy") or "direct").strip().lower()
+    if strategy not in ("direct", "hyde", "decompose"):
+        strategy = "direct"
+    scope = str(data.get("scope") or "kb").strip().lower()
+    if scope not in ("kb", "general", "mixed"):
+        scope = "kb"
+    subs = [
+        str(s).strip()
+        for s in (data.get("sub_queries") or [])
+        if str(s).strip()
+    ][:4]
+    return {
+        "strategy": strategy,
+        "sub_queries": subs,
+        "scope": scope,
+        "reason": str(data.get("reason") or "")[:120],
+    }
+
+
+def merge_hits(*lists: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """多路检索结果合并：同 (文档, 分块) 取高分，按分排序"""
+    merged: Dict[tuple, Dict[str, Any]] = {}
+    for hits in lists:
+        for hit in hits:
+            key = (int(hit["document_id"]), int(hit.get("chunk_index") or 0))
+            prev = merged.get(key)
+            if prev is None or float(hit.get("score") or 0) > float(prev.get("score") or 0):
+                merged[key] = hit
+    return sorted(merged.values(), key=lambda h: -float(h.get("score") or 0))
+
+
+def check_answer(
+    question: str, answer: str, chunks: List[Dict[str, Any]], fmt: str, scope: str = ""
+) -> List[str]:
+    """
+    生成后的低成本自检（纯规则，0 成本）
+
+    只查"机器判得准"的四类问题，判不准的（逻辑是否连贯）交给模型重写——
+    所以这里不追求覆盖率，追求零误报：误报会白花一次重写。
+    """
+    issues: List[str] = []
+    if not answer.strip():
+        return ["empty"]
+    if not chunks:
+        return issues
+
+    # 1. 引用编号越界：模型引用了不存在的资料序号（最常见的是凭记忆编号）
+    cited = [int(n) for n in re.findall(r"\[(\d{1,2})\]", answer)]
+    if cited and max(cited) > len(chunks):
+        issues.append(
+            f"引用编号越界：答案引用了 [{max(cited)}]，但资料只有 {len(chunks)} 条"
+        )
+
+    # 2. 重复句：同一句话换个标点又写一遍（中文一句常不到 10 字，阈值取 6）
+    sents = [
+        re.sub(r"\s+", "", s.strip())
+        for s in _SENT_SPLIT.split(answer)
+        if len(s.strip()) >= 6
+    ]
+    if sents:
+        dup = len(sents) - len(set(sents))
+        if dup >= 1 and dup / len(sents) >= 0.15:
+            issues.append(f"重复表述：{len(sents)} 句里有 {dup} 句是重复的")
+
+    # 3. 篇幅与证据不匹配：资料没那么多内容，答案却写了很长，多半是自行发挥
+    context_chars = sum(len(c.get("content") or "") for c in chunks)
+    if fmt == "keywords" and len(answer) > 150:
+        issues.append(f"形式不符：要求关键词，实际写了 {len(answer)} 字")
+    elif fmt == "short" and len(answer) > 120:
+        issues.append(f"形式不符：要求简短，实际写了 {len(answer)} 字")
+    elif context_chars and len(answer) > max(500, context_chars * 0.8):
+        issues.append(
+            f"超出资料体量：答案 {len(answer)} 字，参考资料合计只有 {context_chars} 字"
+        )
+
+    # 4. 跨文档拼接：不是对比类问题，却把 3 篇以上文档的内容混成一段
+    #    通用概念题本来就该"概念 + 各项目实例"，引用多篇文档是正常的，不算毛病
+    docs = {c["document_id"] for c in chunks}
+    q = question or ""
+    comparison = any(w in q for w in ("对比", "比较", "区别", "哪些文档", "分别", "异同"))
+    if len(docs) >= 3 and not comparison and scope not in ("general", "mixed"):
+        issues.append(f"跨文档拼接：资料来自 {len(docs)} 篇不同文档，且问题并未要求对比")
+
+    return issues
+
+
+def _top_vector_score(chunks: List[Dict[str, Any]]) -> float:
+    """最高向量分（用原始向量分，不用加了文件名 boost 的最终分）"""
+    return max(
+        (float(c.get("vector_score") if c.get("vector_score") is not None else c.get("score") or 0)
+         for c in chunks),
+        default=0.0,
+    )
+
 
 # ---------------- 证据收集循环的提示词 ----------------
 _RESEARCH_SYSTEM = """你是知识库问答 agent。你的任务不是写答案，而是**收集足以回答问题的资料**。
@@ -105,8 +439,12 @@ class QAAgent(BaseAgent):
         context: str,
         question: str,
         history: Optional[List[Dict[str, str]]] = None,
+        fmt: str = "default",
+        low_relevance: bool = False,
+        outline: str = "",
+        scope: str = "",
     ) -> str:
-        """组装 human 消息：对话历史 + 参考资料 + 问题"""
+        """组装 human 消息：对话历史 + 参考资料 + 提纲 + 输出形式 + 问题"""
         blocks: List[str] = []
         if history:
             lines = []
@@ -115,8 +453,22 @@ class QAAgent(BaseAgent):
                 lines.append(f"{who}：{item.get('content', '')}")
             blocks.append("【对话历史】\n" + "\n".join(lines))
         blocks.append("【参考资料】\n" + context)
+        scope_hint = _SCOPE_HINTS.get(scope or "")
+        if scope_hint:
+            blocks.append(scope_hint)
+        if outline:
+            blocks.append(_OUTLINE_HINT.format(outline=outline))
+        hint = _FORMAT_HINTS.get(fmt) or ""
+        if hint:
+            blocks.append(hint)
+        if low_relevance:
+            blocks.append(
+                "【注意】本次检索到的参考资料与问题的相关度较低。"
+                "如果它们确实回答不了这个问题，就直接说明「知识库中没有相关内容」，"
+                "不要勉强用不相关的材料拼凑答案。"
+            )
         blocks.append("【问题】\n" + question)
-        blocks.append("请基于参考资料作答。")
+        blocks.append("请按要求作答。")
         return "\n\n".join(blocks)
 
     @staticmethod
@@ -242,6 +594,7 @@ class QAAgent(BaseAgent):
         top_k: Optional[int] = None,
         document_ids: Optional[List[int]] = None,
         use_name_match: bool = True,
+        plan: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         运行证据收集循环
@@ -259,6 +612,21 @@ class QAAgent(BaseAgent):
         top_k = int(top_k or settings.search_top_k)
         talk = int(settings.qa_agent_max_steps)
         toolbox = self._make_toolbox(top_k, document_ids, use_name_match)
+        plan = plan or {}
+
+        hint = ""
+        if plan.get("strategy") == "decompose" and plan.get("sub_queries"):
+            hint = (
+                f"【规划建议】这个问题有多个子目标，先分别检索："
+                f"{'、'.join(plan['sub_queries'][:4])}\n"
+            )
+        elif plan.get("strategy") == "hyde":
+            hint = "【规划建议】问题偏抽象，检索时多换几种说法，不要只用原句。\n"
+        if plan.get("scope") in ("general", "mixed"):
+            hint += (
+                "【规划建议】用户问的是通用概念，知识库里可能只有某个具体实例。"
+                "检索时不要只认项目名，把概念本身也当检索词试一次。\n"
+            )
 
         llm = self.llm.bind_tools(_LOOP_TOOLS)
         messages = [
@@ -266,6 +634,7 @@ class QAAgent(BaseAgent):
             HumanMessage(
                 content=(
                     f"{self._history_text(history)}"
+                    f"{hint}"
                     f"【当前问题】{question}\n\n"
                     "请开始收集资料，够了就调用 finish。"
                 )
@@ -386,17 +755,115 @@ class QAAgent(BaseAgent):
             return True
 
         q = (question or "").strip()
+        # 只要关键词/一句话的请求，单次检索就够了：进循环等于为 5 个词把整篇文档读一遍
+        # （实测"总结《…》只要 5 个关键词"走了 5 步、读了 22 个片段，5.9 秒）
+        if detect_format(q) in ("keywords", "short"):
+            return False
+
         if any(word in q for word in self._TRIGGER_WORDS):
             return True
 
         if history and (len(q) <= 12 or any(q.startswith(w) for w in self._REFER_WORDS)):
             return True
 
+        # 重排会改变顺序，所以取"全体的最高分"而不是第一条的分数
         try:
-            top = float(chunks[0].get("score") or 0.0)
+            top = max(float(c.get("score") or 0.0) for c in chunks)
         except (TypeError, ValueError):
             top = 0.0
         return top < float(settings.qa_agent_score_gate)
+
+    # ---------- 检索规划 ----------
+    def _plan_query(
+        self, question: str, history: Optional[List[Dict[str, str]]] = None
+    ) -> Dict[str, Any]:
+        """让模型决定：直接查 / HyDE / 拆子问题，以及问题属于通用概念还是具体项目"""
+        if not settings.qa_query_plan_enabled:
+            return {"strategy": "direct", "sub_queries": [], "scope": "kb", "reason": "规划已关闭"}
+
+        hist = ""
+        if history:
+            lines = [f"{'用户' if m.get('role') == 'user' else '助手'}：{m.get('content', '')[:80]}" for m in history[-4:]]
+            hist = "【对话历史】\n" + "\n".join(lines) + "\n\n"
+
+        try:
+            raw = self.invoke_llm(
+                _QUERY_PLAN_TEMPLATE.format(history=hist, question=question),
+                system=_QUERY_PLAN_SYSTEM,
+                max_tokens=200,
+            )
+            plan = parse_plan(raw)
+        except Exception as exc:  # 规划失败就退回直接检索，不能挡住问答
+            logger.warning(f"检索规划失败，退回直接检索: {exc}")
+            return {"strategy": "direct", "sub_queries": [], "scope": "kb", "reason": "规划失败"}
+
+        # 规则兜底：问的是概念，就不能被规划成"某个具体项目"的题。
+        # 模型判层级不稳定（同一个问题两次分别给出 general/mixed），所以补一条可解释的规则：
+        # 有概念性问法、又没指向具体文档/项目时，一律按 general 处理。
+        q = question or ""
+        conceptual = any(
+            w in q
+            for w in (
+                "什么是", "是什么", "讲讲", "讲解", "介绍一下", "解释",
+                "详细说", "怎么理解", "一般怎么", "通常怎么", "如何选", "怎么选",
+            )
+        )
+        doc_ref = "《" in q or any(
+            w in q for w in ("简历", "试卷", "面试", "EduAgent", "ResumeAgent", "这篇", "文档中")
+        )
+        if conceptual and not doc_ref and plan["scope"] != "general":
+            plan["scope"] = "general"
+            plan["reason"] = (plan["reason"] + "｜规则：概念性提问")[:120]
+
+        logger.info(
+            f"检索规划：策略={plan['strategy']} 层级={plan['scope']} "
+            f"子问题={len(plan['sub_queries'])} 理由={plan['reason'][:40]}"
+        )
+        return plan
+
+    def _hypothetical_answer(self, question: str) -> str:
+        """HyDE：先让模型写一段"像样的答案"，用它去检索，弥补问题与资料措辞的差距"""
+        try:
+            return self.invoke_llm(
+                _HYDE_TEMPLATE.format(question=question),
+                system=_HYDE_SYSTEM,
+                max_tokens=int(settings.qa_hyde_max_tokens),
+            ).strip()
+        except Exception as exc:
+            logger.warning(f"HyDE 生成失败，退回原问题检索: {exc}")
+            return ""
+
+    def _retrieve_planned(
+        self,
+        question: str,
+        plan: Dict[str, Any],
+        top_k: int,
+        document_ids: Optional[List[int]],
+        use_name_match: bool,
+    ) -> List[Dict[str, Any]]:
+        """按规划执行检索，多路结果合并去重"""
+        strategy = plan.get("strategy") or "direct"
+
+        if strategy == "hyde":
+            hypo = self._hypothetical_answer(question)
+            if hypo:
+                logger.info(f"HyDE 检索词：{hypo[:60]}")
+                return merge_hits(
+                    self._retrieve(question, top_k, document_ids, use_name_match),
+                    self._retrieve(hypo, top_k, document_ids, use_name_match),
+                )[: top_k * 2]
+
+        elif strategy == "decompose":
+            subs = plan.get("sub_queries") or []
+            if len(subs) >= 2:
+                logger.info(f"拆分检索：{subs}")
+                per = max(3, int(top_k))
+                lists = [
+                    self._retrieve(s, per, document_ids, use_name_match) for s in subs
+                ]
+                return merge_hits(*lists)[: top_k * 2]
+
+        return self._retrieve(question, top_k, document_ids, use_name_match)
 
     # ---------- 证据收集的统一入口（带降级）----------
     def collect(
@@ -417,43 +884,157 @@ class QAAgent(BaseAgent):
         agent 关闭或循环异常时同样退回单次结果——任何情况下都不该比改造前更差。
         """
         top_k = int(top_k or settings.search_top_k)
-        base = self._retrieve(question, top_k, document_ids, use_name_match)
+        plan = self._plan_query(question, history)
+        base = self._retrieve_planned(question, plan, top_k, document_ids, use_name_match)
 
         if not settings.qa_agent_enabled and not force_agent:
-            return {
+            solved: Dict[str, Any] = {
                 "chunks": base,
                 "steps": [],
                 "queries": [],
                 "gave_up": False,
                 "degraded": True,
             }
-
-        if not force_agent and not self._needs_agent(question, base, history):
-            return {
+        elif not force_agent and detect_format(question) in ("keywords", "short"):
+            solved = {
                 "chunks": base,
                 "steps": [],
                 "queries": [],
                 "gave_up": False,
                 "gated": True,
             }
-
-        try:
-            return self.solve(
-                question,
-                history=history,
-                top_k=top_k,
-                document_ids=document_ids,
-                use_name_match=use_name_match,
-            )
-        except Exception as exc:
-            logger.warning(f"agent 循环失败，降级为单次检索: {exc}")
-            return {
+        elif (
+            not force_agent
+            and not settings.qa_agent_always
+            and not self._needs_agent(question, base, history)
+        ):
+            solved = {
                 "chunks": base,
                 "steps": [],
                 "queries": [],
                 "gave_up": False,
-                "degraded": True,
+                "gated": True,
             }
+        else:
+            try:
+                solved = self.solve(
+                    question,
+                    history=history,
+                    top_k=top_k,
+                    document_ids=document_ids,
+                    use_name_match=use_name_match,
+                    plan=plan,
+                )
+            except Exception as exc:
+                logger.warning(f"agent 循环失败，降级为单次检索: {exc}")
+                solved = {
+                    "chunks": base,
+                    "steps": [],
+                    "queries": [],
+                    "gave_up": False,
+                    "degraded": True,
+                }
+
+        solved["plan"] = plan
+        solved["steps"] = list(solved.get("steps") or [])
+        solved["steps"].insert(
+            0,
+            {
+                "step": "plan",
+                "tool": "query_plan",
+                "args": {
+                    "strategy": plan.get("strategy"),
+                    "scope": plan.get("scope"),
+                    "sub_queries": plan.get("sub_queries"),
+                },
+                "observation": plan.get("reason") or "",
+            },
+        )
+
+        # 统一在这里重排：所有调用方（同步/流式/引用）拿到的顺序必须一致，
+        # 否则提示词里的编号和 citations 里的编号会对不上
+        solved["chunks"] = order_chunks(solved["chunks"])
+        solved["chunks"] = self._expand_neighbors(solved["chunks"])
+        return solved
+
+    # ---------- 相邻片段补全 ----------
+    def _expand_neighbors(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        给排名靠前的文档补上命中片段的前后邻居
+
+        检索只返回"最像的块"，段落经常从半句开始、到半句结束，模型读起来是断的。
+        这里按 (document_id, chunk_index±1) 去库里把邻居捞出来，再统一重排，
+        让每个文档的上下文变成一段连续的原文。每个文档最多补 _CTX_NEIGHBORS_PER_DOC 块。
+        """
+        if not chunks:
+            return chunks
+
+        from app.db.database import session_scope
+        from app.models.document import Chunk
+
+        groups: Dict[int, List[Dict[str, Any]]] = {}
+        for c in chunks:
+            groups.setdefault(int(c["document_id"]), []).append(c)
+        ranked = sorted(
+            groups.items(),
+            key=lambda kv: -max(float(c.get("score") or 0) for c in kv[1]),
+        )
+
+        wanted: Dict[int, List[int]] = {}
+        for doc_id, items in ranked[:_CTX_MAX_DOCS]:
+            have = {int(c.get("chunk_index") or 0) for c in items}
+            need: List[int] = []
+            for idx in sorted(have):
+                for nb in (idx - 1, idx + 1):
+                    if nb >= 0 and nb not in have and nb not in need:
+                        need.append(nb)
+            if need:
+                wanted[doc_id] = need[:_CTX_NEIGHBORS_PER_DOC]
+
+        if not wanted:
+            return chunks
+
+        try:
+            with session_scope() as db:
+                rows = (
+                    db.query(Chunk)
+                    .filter(
+                        Chunk.document_id.in_(list(wanted.keys()))
+                    )
+                    .all()
+                )
+            by_key = {(r.document_id, r.chunk_index): r for r in rows}
+        except Exception as exc:  # 补邻居失败不能影响回答
+            logger.warning(f"补相邻片段失败: {exc}")
+            return chunks
+
+        # 邻居沿用同一文档已有片段的标题/文件名，分数记 0（它不是因为相似进来的）
+        meta = {doc: items[0] for doc, items in groups.items()}
+        extra: List[Dict[str, Any]] = []
+        for doc_id, idxs in wanted.items():
+            base = meta[doc_id]
+            for idx in idxs:
+                row = by_key.get((doc_id, idx))
+                if row is None:
+                    continue
+                extra.append(
+                    {
+                        "document_id": doc_id,
+                        "chunk_index": idx,
+                        "content": row.content,
+                        "title": base.get("title"),
+                        "filename": base.get("filename"),
+                        "score": 0.0,
+                        "vector_score": 0.0,
+                        "name_score": 0.0,
+                        "match_type": "neighbor",
+                    }
+                )
+
+        if not extra:
+            return chunks
+        logger.debug(f"补入 {len(extra)} 个相邻片段")
+        return order_chunks(chunks + extra)
 
     # ---------- 同步问答 ----------
     def run(self, **kwargs: Any) -> Dict[str, Any]:
@@ -475,6 +1056,7 @@ class QAAgent(BaseAgent):
 
         solved = self.collect(question, history, top_k, document_ids, use_name_match)
         chunks = solved["chunks"]
+        steps = list(solved["steps"])
 
         if not chunks:
             return {
@@ -482,43 +1064,196 @@ class QAAgent(BaseAgent):
                 "answer": "知识库中暂未检索到与该问题相关的内容。请先上传相关文档，或换一种问法试试。",
                 "citations": [],
                 "retrieved": 0,
-                "steps": solved["steps"],
+                "steps": steps,
                 "queries": solved["queries"],
             }
 
+        # 硬闸门：最强的一条都低于下限，说明知识库里确实没有相关内容。
+        # 直接回固定话术，省掉一次 2~8 秒的生成，也避免模型硬凑。
+        top_score = _top_vector_score(chunks)
+        gave_up = bool(solved.get("gave_up"))
+        if top_score < float(settings.qa_answer_floor) or (
+            # 模型自己放弃，且检索分也不高：它已经判断"搜不到"，就别再让它硬写
+            gave_up
+            and top_score < float(settings.qa_agent_score_gate)
+        ):
+            logger.info(
+                f"拒绝作答（top1={top_score:.3f}, gave_up={gave_up}）：'{question[:24]}'"
+            )
+            return {
+                "question": question,
+                "answer": (
+                    "知识库中没有找到与该问题相关的内容。"
+                    "可以换一种问法，或先上传相关文档。"
+                ),
+                "citations": [],
+                "retrieved": len(chunks),
+                "steps": steps
+                + [
+                    {
+                        "step": "gate",
+                        "tool": "low_relevance",
+                        "args": {
+                            "top1": round(top_score, 3),
+                            "gave_up": gave_up,
+                        },
+                        "observation": "相关度低于下限或模型已放弃检索，未作答",
+                    }
+                ],
+                "queries": solved["queries"],
+            }
+
+        low_relevance = top_score < float(settings.qa_low_relevance_gate)
+        fmt = detect_format(question)
+        scope = (solved.get("plan") or {}).get("scope", "")
         context = self._build_context(chunks)
-        answer = self._run_chain(question, context, history)
+        outline = self._plan_outline(question, context, fmt)
+        answer = self._run_chain(
+            question,
+            context,
+            history,
+            low_relevance=low_relevance,
+            fmt=fmt,
+            outline=outline,
+            scope=scope,
+        )
+        if outline:
+            steps.append(
+                {
+                    "step": "outline",
+                    "tool": "plan",
+                    "args": {"lines": len([x for x in outline.splitlines() if x.strip()])},
+                    "observation": outline[:120],
+                }
+            )
+
+        # 生成后自检：规则命中才重写一次（自检本身不花钱，重写才花）
+        answer, review = self._review_and_repair(question, answer, chunks, scope)
+        if review["triggered"] or review["issues"]:
+            steps.append(
+                {
+                    "step": "review",
+                    "tool": "self_check",
+                    "args": {"issues": review["issues"]},
+                    "observation": "已重写" if review["repaired"] else "未重写",
+                }
+            )
 
         return {
             "question": question,
             "answer": answer,
             "citations": self._citations(chunks),
             "retrieved": len(chunks),
-            "steps": solved["steps"],
+            "steps": steps,
             "queries": solved["queries"],
             "gave_up": solved.get("gave_up", False),
             "degraded": solved.get("degraded", False),
         }
+
+    def _review_and_repair(
+        self, question: str, answer: str, chunks: List[Dict[str, Any]], scope: str = ""
+    ) -> tuple:
+        """
+        生成后自检 + 条件重写
+
+        为什么不直接"让模型自己检查一遍"：
+            - 无 rubric 的自评几乎总是"我觉得没问题"，白花一次调用；
+            - 所以先用规则查机器判得准的毛病（引用越界/重复句/超出资料体量/跨文档拼接），
+              只有命中才叫模型，并且把"具体哪里有问题"作为输入交回去；
+            - 重写只做 1 次，避免"改坏→再改"的抖动。
+        """
+        fmt = detect_format(question)
+        issues = check_answer(question, answer, chunks, fmt, scope)
+        result = {"triggered": bool(issues), "issues": issues, "repaired": False}
+        if not issues:
+            return answer, result
+        if not settings.qa_review_enabled:
+            logger.info(f"答案自检命中但重写已关闭：{issues}")
+            return answer, result
+
+        # 重写阶段只喂最相关的几条片段，避免又一次把整库拖进来
+        context = self._build_context(chunks[:6])
+        try:
+            fixed = self.invoke_llm(
+                _REPAIR_TEMPLATE.format(
+                    question=question,
+                    answer=answer,
+                    issues="\n".join(f"- {i}" for i in issues),
+                    context=context,
+                ),
+                system=_REPAIR_SYSTEM,
+                max_tokens=_FORMAT_MAX_TOKENS[fmt],
+            ).strip()
+        except Exception as exc:
+            logger.warning(f"答案重写失败，沿用原文: {exc}")
+            return answer, result
+
+        # 重写反而更糟（变短一半以上/空）就不要了
+        if not fixed or len(fixed) < len(answer) * 0.5:
+            logger.info("重写结果异常，沿用原答案")
+            return answer, result
+
+        logger.info(
+            f"答案已重写：{len(answer)}字 -> {len(fixed)}字，问题={issues}"
+        )
+        result["repaired"] = True
+        return fixed, result
+
+    def _plan_outline(self, question: str, context: str, fmt: str) -> str:
+        """
+        作答前先列提纲
+
+        资料是按顺序拼的，模型逐段看、逐段写，最后常常是"每段都合理、
+        放一起没逻辑"。先让它定一个能自洽的骨架（结论 → 支撑 → 边界），
+        再按骨架填内容，比事后重写有效得多。
+        """
+        if not settings.qa_outline_enabled:
+            return ""
+        if fmt not in ("default", "detailed"):
+            return ""
+        if len(context) < 600:  # 资料太少，没什么可规划的
+            return ""
+        try:
+            outline = self.invoke_llm(
+                _OUTLINE_TEMPLATE.format(context=context, question=question),
+                system=_OUTLINE_SYSTEM,
+                max_tokens=int(settings.qa_outline_max_tokens),
+            )
+        except Exception as exc:
+            logger.warning(f"生成提纲失败，直接作答: {exc}")
+            return ""
+        return outline.strip()
 
     def _run_chain(
         self,
         question: str,
         context: str,
         history: Optional[List[Dict[str, str]]] = None,
+        low_relevance: bool = False,
+        fmt: Optional[str] = None,
+        outline: str = "",
+        scope: str = "",
     ) -> str:
-        """LangChain LCEL 链：Prompt | LLM | StrOutputParser"""
+        """LangChain LCEL 链：Prompt | LLM(~max_tokens) | StrOutputParser"""
         from langchain_core.output_parsers import StrOutputParser
         from langchain_core.prompts import ChatPromptTemplate
 
+        fmt = fmt or detect_format(question)
         prompt = ChatPromptTemplate.from_messages(
             [
                 ("system", _SYSTEM_PROMPT),
                 ("human", _USER_TEMPLATE),
             ]
         )
-        chain = prompt | self.llm | StrOutputParser()
+        # 按形式卡输出预算：不卡的话全局 2048 会让"给我几个关键词"写成一千多字
+        llm = self.llm.bind(max_tokens=_FORMAT_MAX_TOKENS[fmt])
+        chain = prompt | llm | StrOutputParser()
         return chain.invoke(
-            {"prompt": self._build_prompt(context, question, history)}
+            {
+                "prompt": self._build_prompt(
+                    context, question, history, fmt, low_relevance, outline, scope
+                )
+            }
         ).strip()
 
     # ---------- 流式问答 ----------
@@ -536,6 +1271,7 @@ class QAAgent(BaseAgent):
         document_ids = kwargs.get("document_ids")
         use_name_match = kwargs.get("use_name_match", True)
         history = kwargs.get("history") or []
+        low_relevance = bool(kwargs.get("low_relevance", False))
         # 流式接口会先调 prepare_stream 拿引用，把检索结果传进来避免重复检索
         # （重复一次 = 多一次 BGE 编码 + 多一次 Milvus 查询）
         chunks = kwargs.get("chunks")
@@ -549,12 +1285,27 @@ class QAAgent(BaseAgent):
             return
 
         context = self._build_context(chunks)
+        fmt = detect_format(question)
+        # 提纲在 prepare_stream 里已经算过（那时更早，能早点把首字推出去）；
+        # 单独调 astream 时才现算，保证两条路径行为一致
+        outline = kwargs.get("outline") or self._plan_outline(question, context, fmt)
         prompt = ChatPromptTemplate.from_messages(
             [("system", _SYSTEM_PROMPT), ("human", _USER_TEMPLATE)]
         )
-        chain = prompt | self.llm | StrOutputParser()
+        llm = self.llm.bind(max_tokens=_FORMAT_MAX_TOKENS[fmt])
+        chain = prompt | llm | StrOutputParser()
 
-        payload = {"prompt": self._build_prompt(context, question, history)}
+        payload = {
+            "prompt": self._build_prompt(
+                context,
+                question,
+                history,
+                fmt,
+                low_relevance,
+                outline,
+                str(kwargs.get("scope") or ""),
+            )
+        }
         async for piece in chain.astream(payload):
             if piece:
                 yield piece
@@ -570,13 +1321,34 @@ class QAAgent(BaseAgent):
             kwargs.get("use_name_match", True),
         )
         chunks = solved["chunks"]
+        plan = solved.get("plan") or {}
+        top_score = _top_vector_score(chunks)
+        gave_up = bool(solved.get("gave_up"))
+        fmt = detect_format(question)
+        outline = self._plan_outline(question, self._build_context(chunks), fmt) if chunks else ""
         return {
             "chunks": chunks,
             "citations": self._citations(chunks) if chunks else [],
             "steps": solved["steps"],
             "queries": solved["queries"],
             "degraded": solved.get("degraded", False),
+            "top_score": round(top_score, 4),
+            "low_relevance": top_score < float(settings.qa_low_relevance_gate),
+            "outline": outline,
+            "scope": plan.get("scope", ""),
+            "plan": plan,
+            "refusal": bool(chunks)
+            and (
+                top_score < float(settings.qa_answer_floor)
+                or (gave_up and top_score < float(settings.qa_agent_score_gate))
+            ),
         }
+
+    def review_answer(
+        self, question: str, answer: str, chunks: List[Dict[str, Any]], scope: str = ""
+    ) -> tuple:
+        """流式路径用：前端已经看到初稿，这里返回 (修正稿, 自检说明)"""
+        return self._review_and_repair(question, answer, chunks, scope)
 
     def health(self) -> Dict[str, Any]:
         ok = milvus_store.health()

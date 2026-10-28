@@ -554,6 +554,12 @@ function ask(preset) {
         currentText.value = answer
         scrollToBottom()
       },
+      // 后端生成后自检发现重复/越界/撑篇幅，会重写一次并用整体替换事件回推
+      onReplace: (text) => {
+        answer = text
+        currentText.value = text
+        scrollToBottom()
+      },
       onError: (msg) => {
         answer = answer || `回答失败：${msg}`
         finalize()

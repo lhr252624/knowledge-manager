@@ -1,0 +1,17 @@
+{
+  "generated_at": "2026-10-28T18:57:29",
+  "threshold": 0.6,
+  "doc_count": 69,
+  "duplicates": {
+    "118": 117
+  },
+  "clusters": [
+    {
+      "rep": 117,
+      "members": [
+        117,
+        118
+      ]
+    }
+  ]
+}
