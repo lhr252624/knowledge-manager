@@ -58,9 +58,9 @@
 | **检索过程**：规划 → 检索 → 列文档，边查边显示 | **回答**：结论在前，引用标出匹配方式 |
 | <img src="screenshots/07-citations-expanded.png" width="430"> | <img src="screenshots/08-search.png" width="430"> |
 | **引用折叠**：默认 4 条，点开展开全部 | **语义检索**：按文档聚合，标相似度与命中片段 |
-| <img src="screenshots/09-graph.png" width="430"> | <img src="screenshots/11-graph-zoom.png" width="430"> |
-| **知识图谱**：实线是语义相似，虚线是名字对得上 | **缩放**：滚轮放大，看清簇内关系 |
-| <img src="screenshots/12-graph-hover.png" width="430"> | |
+| <img src="screenshots/09-graph.png" width="430"> | <img src="screenshots/10-graph-zoom.png" width="430"> |
+| **知识图谱**：实线是语义相似，虚线是名字对得上 | **阈值**：提示阈值，看清簇内关系 |
+| <img src="screenshots/11-graph-hover.png" width="430"> | |
 | **悬停详情**：类型、分块数、文档摘要 | |
 
 ## 技术栈
@@ -218,20 +218,20 @@ BGE-M3（20~60 秒），日志出现 `嵌入模型预热完成` 再去传文档�
 
 ### 检索
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `SEARCH_TOP_K` | `5` | 向量召回条数 |
-| `SCORE_THRESHOLD` | `0.35` | 低于该分直接丢弃；0 会把噪声全放进上下文 |
-| `EMBED_WITH_NAME` | `true` | 文件名/标题拼进待嵌入文本 |
-| `FILENAME_MATCH_THRESHOLD` | `0.45` | 名称相似度达到即算命中，参与加分 |
-| `FILENAME_STRONG_THRESHOLD` | `0.75` | 强命中保底入选；只给整名基本命中的文档 |
-| `FILENAME_BOOST` | `0.20` | 命中加分上限，按覆盖度打折 |
-| `GRAPH_NAME_EDGE_THRESHOLD` | `0.6` | 图谱里文件名关联边的连边阈值 |
-| `RETRIEVAL_RERANK_ENABLED` | `true` | 检索阶段交叉编码器重排 |
-| `RETRIEVAL_RERANK_CANDIDATES` / `RETRIEVAL_RERANK_MIN_CONFIDENT` | `12` / `0.5` | 重排候选数；最高分低于 0.5 则保持向量序 |
-| `RETRIEVAL_RERANK_BATCH_SIZE` | `8` | 一次前向的批大小，太大爆显存 |
-| `RETRIEVAL_DEDUP_ENABLED` / `RETRIEVAL_DEDUP_PENALTY` | `true` / `0.5` | 近重复文档降权，副本分数打 5 折 |
-| `RETRIEVAL_DEDUP_FILE` | `<root>/backend/data/doc_duplicates.json` | 判重映射，由脚本生成 |
+| 变量                                                         | 默认值                                          | 说明                                     |
+| ------------------------------------------------------------ | ----------------------------------------------- | ---------------------------------------- |
+| `SEARCH_TOP_K`                                               | `5`                                             | 向量召回条数                             |
+| `SCORE_THRESHOLD`                                            | `0.35`                                          | 低于该分直接丢弃；0 会把噪声全放进上下文 |
+| `EMBED_WITH_NAME`                                            | `true`                                          | 文件名/标题拼进待嵌入文本                |
+| `FILENAME_MATCH_THRESHOLD`                                   | `0.45`                                          | 名称相似度达到即算命中，参与加分         |
+| `FILENAME_STRONG_THRESHOLD`                                  | `0.75`                                          | 强命中保底入选；只给整名基本命中的文档   |
+| `FILENAME_BOOST`                                             | `0.20`                                          | 命中加分上限，按覆盖度打折               |
+| `GRAPH_NAME_EDGE_THRESHOLD`                                  | `0.6`                                           | 图谱里文件名关联边的连边阈值             |
+| `RETRIEVAL_RERANK_ENABLED`                                   | `true`                                          | 检索阶段交叉编码器重排                   |
+| `RETRIEVAL_RERANK_CANDIDATES` / `RETRIEVAL_RERANK_MIN_CONFIDENT` | `12` / `0.5`                                    | 重排候选数；最高分低于 0.5 则保持向量序  |
+| `RETRIEVAL_RERANK_BATCH_SIZE`                                | `8`                                             | 一次前向的批大小，太大爆显存             |
+| `RETRIEVAL_DEDUP_ENABLED` / `RETRIEVAL_DEDUP_PENALTY`        | `true` / `0.5`                                  | 近重复文档降权，副本分数打 5 折          |
+| `RETRIEVAL_DEDUP_FILE`                                       | `<root>/backend/<br />data/doc_duplicates.json` | 判重映射，由脚本生成                     |
 
 ### 问答 Agent
 
