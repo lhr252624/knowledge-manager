@@ -327,11 +327,13 @@ npm run dev
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `SEARCH_TOP_K` | `5` | 向量召回条数 |
-| `SCORE_THRESHOLD` | `0.0` | 低于该分数的分块直接丢弃 |
+| `SCORE_THRESHOLD` | `0.35` | 低于该分数的分块直接丢弃（0.0 会把噪声全放进上下文） |
 | `EMBED_WITH_NAME` | `true` | 把文件名/标题拼进待嵌入文本 |
 | `FILENAME_MATCH_THRESHOLD` | `0.45` | 名称相似度达到即算"文件名命中"，参与加分 |
 | `FILENAME_STRONG_THRESHOLD` | `0.75` | 强命中，直接保底入选（只给"整名基本命中"，共享前缀不算） |
-| `FILENAME_BOOST` | `0.20` | 命中时给向量分加的最大值 |
+| `FILENAME_BOOST` | `0.20` | 命中时给向量分加的最大值（按覆盖度打折） |
+| `RETRIEVAL_RERANK_ENABLED` | `true` | 检索阶段用交叉编码器重排（12 候选批次 8） |
+| `RETRIEVAL_DEDUP_PENALTY` | `0.5` | 重复文档副本的分数折扣 |
 | `GRAPH_NAME_EDGE_THRESHOLD` | `0.6` | 图谱里"文件名关联"边的连边阈值 |
 
 ### 问答缓存
