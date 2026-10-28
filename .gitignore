@@ -33,8 +33,9 @@ data/uploads/*
 logs/
 *.log
 
-# ---------- 截图（内含真实文档名，按需本地生成） ----------
-screenshots/
+# ---------- 截图 ----------
+# screenshots/ 里的展示图入库（README 引用）；临时截图放 .tmp/
+screenshots/*.tmp.png
 
 # ---------- Python ----------
 __pycache__/
