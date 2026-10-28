@@ -42,8 +42,10 @@
 | **检索过程**：规划 → 检索 → 列文档，边查边显示 | **回答**：结论在前，引用标出匹配方式 |
 | <img src="screenshots/07-citations-expanded.png" width="430"> | <img src="screenshots/08-search.png" width="430"> |
 | **引用折叠**：默认 4 条，点开展开全部 | **语义检索**：按文档聚合，标相似度与命中片段 |
-| <img src="screenshots/09-graph.png" width="430"> | |
-| **知识图谱**：实线是语义相似，虚线是名字对得上 | |
+| <img src="screenshots/09-graph.png" width="430"> | <img src="screenshots/11-graph-zoom.png" width="430"> |
+| **知识图谱**：实线是语义相似，虚线是名字对得上 | **缩放**：滚轮放大，看清簇内关系 |
+| <img src="screenshots/12-graph-hover.png" width="430"> | |
+| **悬停详情**：类型、分块数、文档摘要 | |
 
 ## 技术栈
 
