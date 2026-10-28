@@ -85,7 +85,7 @@ class Settings(BaseSettings):
     # False: 退回固定单次检索 + 作答（改造前的行为），用于对照与排障
     qa_agent_enabled: bool = True
     # 证据收集最多几步。每步一次 LLM 往返，3 步大约多花 3~4 秒
-    qa_agent_max_steps: int = 3
+    qa_agent_max_steps: int = 2
     # 单次检索的最高分低于该值时，认为"一次没搜好"，交给 agent 换措辞重搜。
     # 调高 = 更多问题走 agent（更准但更慢），调低 = 更多问题走单次检索（更快）
     qa_agent_score_gate: float = 0.55

@@ -418,11 +418,17 @@ def check_answer(
         )
 
     # 4. 跨文档拼接：不是对比类问题，却把 3 篇以上文档的内容混成一段
-    #    通用概念题本来就该"概念 + 各项目实例"，引用多篇文档是正常的，不算毛病
+    #    通用概念题本来就该"概念 + 各项目实例"，引用多篇文档是正常的，不算毛病；
+    #    短答案引 3 篇多半是"总览引用"（上下文本身最多 3 篇），只有长答案才谈得上拼接。
     docs = {c["document_id"] for c in chunks}
     q = question or ""
     comparison = any(w in q for w in ("对比", "比较", "区别", "哪些文档", "分别", "异同"))
-    if len(docs) >= 3 and not comparison and scope not in ("general", "mixed"):
+    if (
+        len(docs) >= 3
+        and not comparison
+        and scope not in ("general", "mixed")
+        and len(answer) >= 800
+    ):
         issues.append(f"跨文档拼接：资料来自 {len(docs)} 篇不同文档，且问题并未要求对比")
 
     return issues
@@ -709,6 +715,7 @@ class QAAgent(BaseAgent):
 
         try:
             for step in range(1, talk + 1):
+                before = len(toolbox.evidence)
                 resp = llm.invoke(messages)
                 messages.append(resp)
                 calls = getattr(resp, "tool_calls", None) or []
@@ -763,6 +770,14 @@ class QAAgent(BaseAgent):
                         )
 
                 if finished:
+                    break
+
+                # 这一轮检索没有带来任何新片段：模型在重复查同一件事，停手
+                if step >= 2 and len(toolbox.evidence) == before:
+                    steps.append(
+                        {"step": step, "tool": "early_stop", "args": {},
+                         "observation": "本轮无新增片段，停止检索"}
+                    )
                     break
 
             chunks = self._enrich(toolbox.collected())
@@ -912,6 +927,20 @@ class QAAgent(BaseAgent):
             plan["scope"] = "general"
             plan["reason"] = (plan["reason"] + "｜规则：概念性提问")[:120]
 
+        # 规则兜底：操作性提问（怎么用/步骤/教程）措辞和资料几乎一致，
+        # 拆子问题或假设答案只会把检索词改得离原文更远，直接查更快更准。
+        howto = any(
+            w in q
+            for w in (
+                "怎么用", "如何使用", "怎么使用", "如何操作", "怎么操作",
+                "操作步骤", "使用步骤", "怎么弄", "教程",
+            )
+        )
+        if howto and plan["strategy"] != "direct":
+            plan["strategy"] = "direct"
+            plan["sub_queries"] = []
+            plan["reason"] = (plan["reason"] + "｜规则：操作性提问")[:120]
+
         logger.info(
             f"检索规划：策略={plan['strategy']} 层级={plan['scope']} "
             f"子问题={len(plan['sub_queries'])} 理由={plan['reason'][:40]}"
@@ -939,25 +968,40 @@ class QAAgent(BaseAgent):
         use_name_match: bool,
     ) -> List[Dict[str, Any]]:
         """按规划执行检索，多路结果合并去重"""
+        from concurrent.futures import ThreadPoolExecutor
+
         strategy = plan.get("strategy") or "direct"
 
         if strategy == "hyde":
-            hypo = self._hypothetical_answer(question)
+            # 假设答案的生成和首轮检索互不依赖：并行跑，省掉一次串行等待
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                base_future = pool.submit(
+                    self._retrieve, question, top_k, document_ids, use_name_match
+                )
+                hypo = self._hypothetical_answer(question)
+                base_hits = base_future.result()
             if hypo:
                 logger.info(f"HyDE 检索词：{hypo[:60]}")
                 return merge_hits(
-                    self._retrieve(question, top_k, document_ids, use_name_match),
+                    base_hits,
                     self._retrieve(hypo, top_k, document_ids, use_name_match),
                 )[: top_k * 2]
+            return base_hits
 
         elif strategy == "decompose":
             subs = plan.get("sub_queries") or []
             if len(subs) >= 2:
                 logger.info(f"拆分检索：{subs}")
                 per = max(3, int(top_k))
-                lists = [
-                    self._retrieve(s, per, document_ids, use_name_match) for s in subs
-                ]
+                with ThreadPoolExecutor(max_workers=min(4, len(subs))) as pool:
+                    lists = list(
+                        pool.map(
+                            lambda s: self._retrieve(
+                                s, per, document_ids, use_name_match
+                            ),
+                            subs,
+                        )
+                    )
                 return merge_hits(*lists)[: top_k * 2]
 
         return self._retrieve(question, top_k, document_ids, use_name_match)
