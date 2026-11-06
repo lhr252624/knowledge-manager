@@ -52,6 +52,38 @@ $env:PLAYWRIGHT_BROWSERS_PATH="$root\.playwright"
 | `verify_filename_ui.py` | 后端 + 前端 + Playwright | 文件名在检索结果/知识图谱里的展示与改名弹窗（自建样例文档，跑完自动清理），共 19 项 |
 | `ui_test.py` | 后端 + 前端 + Playwright | 全流程走查（概览/上传/问答/检索/图谱）并截图到 `screenshots/` |
 | `verify_summary_agent.py` | 仅 LLM（不启动后端） | 摘要 Agent 的因果验证：把结论埋到 2500 字之后（旧实现必漏），断言新实现轨迹覆盖尾部且摘要采纳结论；另含步数上限、重复读取防护、reduce 兜底、短文档走单次，共 16 项 |
+| `verify_qa_agent.py` | LLM + Milvus | 闸门逻辑（确定性，直接测 `_needs_agent`）+ 集成：降级、轮次预算、强制循环、`run()` 同步路径，共 10 项 |
+| `eval_qa_retrieval.py` | 后端 | 检索召回基线：12 条单轮 + 3 条多轮追问，按"召回片段里必须出现的关键串"判命中 |
+| `eval_qa_agent.py` | 后端 | 答案级 A/B：同一批题跑 `/qa`，看关键串是否出现在答案或引用预览里，对比耗时与步数（题目写死在代码里，对应旧语料） |
+| `eval_ab_qa.py` | 仅本地模型 + LLM（不启动后端） | 进程内 A/B：读 `ab_questions.json` 的 15 条标注题（题目出自当前库），翻 `qa_agent_enabled` 对比 agent 循环开/关的**答案命中 / 片段命中 / 文档命中**、耗时与步数；`--limit` 试水，`--only` 按 group 过滤 |
+
+## 问答 A/B 的题目怎么出
+
+`ab_questions.json` 每题长这样：
+
+```json
+{
+  "id": "resume-recall",
+  "group": "resume_agent",
+  "type": "single | followup | refuse",
+  "question": "ResumeAgent 在 200 多份简历上测出来的问题召回率是多少？",
+  "key": {"document_id": 168, "chunk_index": 7, "string": "84.7%"},
+  "followup": {"question": "那 MAE 呢", "key": {"document_id": 168, "chunk_index": 8, "string": "3.8"}},
+  "note": "第四章 · 实测指标"
+}
+```
+
+- `key.string` **必须逐字出现在该 `document_id` 的该 `chunk_index` 分块里**，否则"片段命中"永远是 0；
+  提交前先跑 `--verify-annotations`（它直接查 Chunk 表，不加载模型），全部 `[OK]` 再跑正式评测
+- `string` 取数字、阈值、指标名这类有辨识度的片段，别取"因此""但是"
+- `string` 在答案里比对时**忽略空白**（"P95 延迟" 与 "P95延迟" 都算命中），但词序和数字仍然严格比
+- 同一个答案的常见写法放 `also`（如 `"string": "项目深度（30%）"` 配 `"also": ["30%", "0.30"]`），
+  任一命中即算答对——判的是"答案对不对"，不是"措辞像不像原文"
+- `type: "refuse"` 的题不写 `key`，只判是否拒答；`type: "followup"` 的题评分只看追问那一轮，
+  耗时按两轮之和计（用户实际等的时间）
+- `B` 组的平均步数会明显小于 2：早退闸门（证据足够、形式类请求、不需要 agent）照样生效，
+  这是线上真实行为；`A` 组因关掉 agent 会被内部标 `degraded`，统计时不把它算作异常
+- 换语料只改这个 JSON，不动脚本
 
 ## 约定
 

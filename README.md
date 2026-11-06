@@ -565,7 +565,8 @@ cd backend
 | `verify_fixes.py` / `verify_history_ui.py` / `verify_filename_ui.py` / `ui_test.py` | 后端+前端 | 轮询、侧栏、改名、全流程走查，共 57 项 |
 | `verify_summary_agent.py` | LLM | 结论在末尾、步数上限、重复读取防护、reduce 兜底，16 项 |
 | `verify_qa_agent.py` | 后端+LLM | 闸门、降级、强制循环、轮次预算、同步 run，10 项 |
-| `eval_qa_retrieval.py` / `eval_qa_agent.py` | 后端(+LLM) | 检索层 15 条评测；答案层 A/B 拨 `QA_AGENT_ENABLED` |
+| `eval_qa_retrieval.py` / `eval_qa_agent.py` | 后端(+LLM) | 旧语料的两份评测（题目写死在脚本里，对应文档已不在库） |
+| `eval_ab_qa.py` | 本地模型+LLM，不起后端 | 进程内 A/B：读 `tests/ab_questions.json` 的 15 条标注题，翻 `qa_agent_enabled` 对比答案/片段/文档命中与耗时；`--verify-annotations` 只核对标注 |
 
 跑 UI 测试前要设临时目录（否则 Playwright 报 `EPERM mkdtemp`），并装好 chromium：
 
@@ -579,16 +580,18 @@ $env:PLAYWRIGHT_BROWSERS_PATH="$root\.playwright"
 
 离线评测：`evaluate_cache_matchers.py`（59 对标注，四种判定器对比）、`measure_index.py`（索引耗时）。
 
-QA agent 的 A/B（15 条，单轮 + 多轮追问）：
+QA agent 的 A/B（15 条标注题，出自当前库；跑两轮共 26 个题次）：
 
-| | agent 关 | agent 开 |
-|---|---|---|
-| 单轮 | 92%（2.8s） | 92%（4.2s） |
-| 多轮追问 | 67%（4.4s） | **100%**（8.0s） |
-| 合计 | 87%（3.6s） | **93%**（6.1s） |
+| | 答案命中 | 片段命中 | 文档命中 | 中位耗时 |
+|---|---|---|---|---|
+| agent 关（单次检索直答） | **88%** | **69%** | **81%** | **12.4s** |
+| agent 开（ReAct 循环，默认） | 85% | 58% | 73% | 17.9s |
 
-提升全在多轮追问，延迟是真实代价。这组数字测于早期的 15 题标注集，那批文档已不在当前知识库中，
-换语料后改 `SINGLE_TURN` / `MULTI_TURN` 的关键串即可重跑（脚本会现打一张同样格式的表）。
+结论不是"打开就更好"：这批题大多是"一次就能搜到"，循环没有翻盘的案例，
+反而有两题被多召回挤掉了原本正确的片段（`exam-idempotent`、`nlp-bert-mlm`），
+代价是中位耗时多 5.5 秒。两轮之间单题结论有 1~2 题的波动，差 1 题不构成显著差异；
+两组都稳定答错的 `rag-contextual` 说明瓶颈在检索召回，而不在循环层。
+这组数字取代了早先"67% → 100%"的说法——那批题对应的文档已不在库里，无法复现，不再引用。
 
 冷启动参考：进程起来到 `/health` 可用约 33s（加载 BGE-M3 与重排模型），首次检索再 ~0.4s 预热。
 

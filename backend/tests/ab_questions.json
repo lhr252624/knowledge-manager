@@ -1,0 +1,204 @@
+{
+  "corpus": {
+    "documents": 71,
+    "chunks": 2734,
+    "built_at": "2026-11-06"
+  },
+  "notes": "每题 key 必须能在该文档该分块的 content 里逐字找到（用 --verify-annotations 校）。doc 187 未用于任何题目，只是库里多出来的一份报告",
+  "questions": [
+    {
+      "id": "resume-recall",
+      "group": "resume_agent",
+      "type": "single",
+      "question": "ResumeAgent 在 200 多份简历上测出来的问题召回率是多少？",
+      "key": {
+        "document_id": 168,
+        "chunk_index": 7,
+        "string": "84.7%"
+      },
+      "note": "ResumeAgent 评测 · 200 份样本的 Issue Recall 实测值"
+    },
+    {
+      "id": "resume-weights",
+      "group": "resume_agent",
+      "type": "single",
+      "question": "简历审查的六个维度里，项目深度这一项占多少权重？",
+      "key": {
+        "document_id": 167,
+        "chunk_index": 25,
+        "string": "项目深度（30%）",
+        "also": ["30%", "0.30"]
+      },
+      "note": "六维度权重设计：项目深度 30%"
+    },
+    {
+      "id": "exam-kappa",
+      "group": "exam_grading",
+      "type": "followup",
+      "question": "试卷批改 Agent 跟教师基准比的时候，用哪个统计量看两边的等级是不是一致？",
+      "key": {
+        "document_id": 179,
+        "chunk_index": 0,
+        "string": "Cohen's κ"
+      },
+      "followup": {
+        "question": "那它至少要达到多少才算达标？",
+        "key": {
+          "document_id": 179,
+          "chunk_index": 15,
+          "string": "目标 ≥ 0.6",
+          "also": ["0.6"]
+        }
+      },
+      "note": "多轮追问：先问等级一致性指标，再追问 κ 的达标线；评分只看追问"
+    },
+    {
+      "id": "exam-idempotent",
+      "group": "exam_grading",
+      "type": "single",
+      "question": "批改结果写进 exam_reviews 表时，怎么保证同一份卷子重复跑不会写出重复记录？",
+      "key": {
+        "document_id": 176,
+        "chunk_index": 19,
+        "string": "先删后插"
+      },
+      "note": "幂等写入：无 UNIQUE 约束时先删后插"
+    },
+    {
+      "id": "rag-contextual",
+      "group": "rag_system",
+      "type": "single",
+      "question": "RAG 里那种先让大模型给每个分块补一句位置说明、然后再去做向量化的做法叫什么？",
+      "key": {
+        "document_id": 171,
+        "chunk_index": 20,
+        "string": "Contextual RAG"
+      },
+      "note": "5.5 核心设计点 Contextual RAG"
+    },
+    {
+      "id": "rag-hybrid-weight",
+      "group": "rag_system",
+      "type": "single",
+      "question": "稠密和稀疏两路召回结果融合时，哪一路的权重更高，具体是多少？",
+      "key": {
+        "document_id": 172,
+        "chunk_index": 4,
+        "string": "WeightedRanker(0.7, 0.3)",
+        "also": ["0.7"]
+      },
+      "note": "Hybrid 融合权重：Dense 0.7 / Sparse 0.3"
+    },
+    {
+      "id": "eval-interview-judge",
+      "group": "eduagent_eval",
+      "type": "followup",
+      "question": "模拟面试 Agent 的报告质量是用什么方式评的？",
+      "key": {
+        "document_id": 180,
+        "chunk_index": 1,
+        "string": "LLM-as-Judge"
+      },
+      "followup": {
+        "question": "那它具体从哪几个维度给报告打分？",
+        "key": {
+          "document_id": 180,
+          "chunk_index": 15,
+          "string": "concreteness",
+          "also": ["可操作性", "评分依据"]
+        }
+      },
+      "note": "多轮追问：先问评测方式，再追问 LLM 评委的三个评分维度；评分只看追问"
+    },
+    {
+      "id": "eval-health-p95",
+      "group": "eduagent_eval",
+      "type": "single",
+      "question": "系统健康度评估里，用来衡量响应速度的那个核心指标叫什么？",
+      "key": {
+        "document_id": 181,
+        "chunk_index": 1,
+        "string": "P95 延迟",
+        "also": ["P95"]
+      },
+      "note": "11-05 三大指标之一：P95 延迟"
+    },
+    {
+      "id": "llm-lora-ratio",
+      "group": "course_notes",
+      "type": "single",
+      "question": "LoRA 在 d=4096、r=8 的时候，参数量比全量微调少了多少？",
+      "key": {
+        "document_id": 113,
+        "chunk_index": 19,
+        "string": "99.6%"
+      },
+      "note": "大模型课程 · LoRA 参数量对比"
+    },
+    {
+      "id": "nlp-bert-mlm",
+      "group": "course_notes",
+      "type": "single",
+      "question": "BERT 做 MLM 预训练时，一段文本里大概有多少 token 会被选出来做掩码？",
+      "key": {
+        "document_id": 119,
+        "chunk_index": 90,
+        "string": "15%的token",
+        "also": ["15%"]
+      },
+      "note": "NLP 基础 · BERT 的 MLM 掩码比例"
+    },
+    {
+      "id": "ml-boosting-vote",
+      "group": "course_notes",
+      "type": "single",
+      "question": "Boosting 跟 Bagging 在投票方式上有什么不一样？",
+      "key": {
+        "document_id": 125,
+        "chunk_index": 3,
+        "string": "加权投票"
+      },
+      "note": "集成学习 · Bagging 平权投票、Boosting 加权投票"
+    },
+    {
+      "id": "db-pool-overflow",
+      "group": "misc",
+      "type": "single",
+      "question": "SQLAlchemy 连接池平时常备 10 个连接，突发流量最多还能临时再开多少个？",
+      "key": {
+        "document_id": 163,
+        "chunk_index": 10,
+        "string": "max_overflow=20",
+        "also": ["20个", "再开 20"]
+      },
+      "note": "连接池弹性机制：max_overflow=20"
+    },
+    {
+      "id": "api-422",
+      "group": "misc",
+      "type": "single",
+      "question": "FastAPI 里请求体不符合 Pydantic 模型时，框架默认会返回什么状态码？",
+      "key": {
+        "document_id": 166,
+        "chunk_index": 7,
+        "string": "422 状态码",
+        "also": ["422"]
+      },
+      "note": "FastAPI 自动校验失败返回 422"
+    },
+    {
+      "id": "refuse-kubernetes",
+      "group": "refuse",
+      "type": "refuse",
+      "question": "这个知识库里有没有讲过 Kubernetes 的 Pod 调度是怎么做的？",
+      "note": "库中无 Kubernetes 内容，期望拒答"
+    },
+    {
+      "id": "refuse-cobol",
+      "group": "refuse",
+      "type": "refuse",
+      "question": "有没有哪份文档专门讲 COBOL 的批处理程序？",
+      "note": "库中无 COBOL 内容，期望拒答"
+    }
+  ]
+}
